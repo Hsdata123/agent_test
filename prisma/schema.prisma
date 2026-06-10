@@ -1,0 +1,189 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String     @id @default(cuid())
+  username     String     @unique
+  nickname     String
+  passwordHash String
+  role         String     @default("creator")
+  status       String     @default("active")
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  lastLoginAt  DateTime?
+
+  projects     Project[]          @relation("ProjectCreator")
+  memberships  ProjectMember[]
+  assets       KnowledgeAsset[]
+  parses       MechanismParse[]
+  tasks        GenerationTask[]
+  sessions     Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  name        String
+  description String?
+  coverUrl    String?
+  creatorId   String
+  status      String        @default("active")
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  creator User               @relation("ProjectCreator", fields: [creatorId], references: [id])
+  members ProjectMember[]
+  parses  MechanismParse[]
+  tasks   GenerationTask[]
+  results GenerationResult[]
+}
+
+model ProjectMember {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String   @default("viewer")
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+}
+
+model KnowledgeAsset {
+  id             String       @id @default(cuid())
+  assetName      String
+  originalName   String
+  assetType      String
+  productName    String?
+  tags           String       @default("[]")
+  aliases        String       @default("[]")
+  description    String?
+  storagePath    String
+  mimeType       String?
+  enabled        Boolean      @default(true)
+  preferred      Boolean      @default(false)
+  vectorStatus   String       @default("pending")
+  extractedText  String?
+  createdById    String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  createdBy User              @relation(fields: [createdById], references: [id])
+  aliasesRel ProductAlias[]
+  items     MechanismItem[]
+}
+
+model ProductAlias {
+  id        String   @id @default(cuid())
+  alias     String
+  assetId   String
+  createdAt DateTime @default(now())
+
+  asset KnowledgeAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([alias, assetId])
+}
+
+model MechanismParse {
+  id             String   @id @default(cuid())
+  projectId      String
+  rawMechanism   String
+  price          Float
+  productSummary String
+  parseStatus    String   @default("success")
+  errorMessage   String?
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  project Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User          @relation(fields: [createdById], references: [id])
+  items   MechanismItem[]
+  tasks   GenerationTask[]
+}
+
+model MechanismItem {
+  id             String    @id @default(cuid())
+  parseId        String
+  productName    String
+  quantity       Int       @default(1)
+  matchedAssetId String?
+  matchType      String    @default("none")
+  matchScore     Float     @default(0)
+
+  parse        MechanismParse  @relation(fields: [parseId], references: [id], onDelete: Cascade)
+  matchedAsset KnowledgeAsset? @relation(fields: [matchedAssetId], references: [id])
+}
+
+model GenerationTask {
+  id              String     @id @default(cuid())
+  projectId       String
+  parseId         String
+  createdById     String
+  outputType      String
+  aspectRatio     String
+  detailPageCount Int?
+  imageCount      Int        @default(1)
+  templateAssetId String?
+  imageSize       String?
+  imageQuality    String?
+  prompt          String?
+  status          String     @default("queued")
+  failureReason   String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  project Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parse   MechanismParse     @relation(fields: [parseId], references: [id], onDelete: Cascade)
+  creator User               @relation(fields: [createdById], references: [id])
+  results GenerationResult[]
+}
+
+model GenerationResult {
+  id          String   @id @default(cuid())
+  taskId      String
+  projectId   String
+  imagePath   String
+  pageIndex   Int?
+  width       Int?
+  height      Int?
+  prompt      String?
+  createdAt   DateTime @default(now())
+
+  task    GenerationTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  project Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model ApiConfig {
+  id             String   @id @default("singleton")
+  textBaseUrl    String   @default("https://token.ithinkai.cn/v1")
+  textModel      String   @default("gpt-5.5-token")
+  textWireApi    String   @default("responses")
+  textPromptCacheEnabled Boolean @default(true)
+  textPromptCacheRetention String @default("24h")
+  textPromptCacheKey String @default("commerce-chat")
+  disableResponseStorage Boolean @default(true)
+  imageBaseUrl   String   @default("https://token.ithinkai.cn/v1")
+  imageModel     String   @default("gpt-image-2")
+  embeddingModel String   @default("text-embedding-3-small")
+  maxConcurrency Int      @default(1)
+  retryCount     Int      @default(2)
+  timeoutSeconds Int      @default(240)
+  updatedAt      DateTime @updatedAt
+}
