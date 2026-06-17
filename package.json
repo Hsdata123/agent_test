@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "db:push": "node prisma/init.mjs && prisma generate",
     "db:seed": "tsx prisma/seed.ts",
+    "db:backfill-aliases": "tsx scripts/backfill-asset-aliases.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {
@@ -17,7 +18,9 @@
     "clsx": "^2.1.1",
     "next": "^15.1.6",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-markdown": "^9.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/archiver": "^6.0.3",

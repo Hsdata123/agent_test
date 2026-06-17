@@ -2,6 +2,10 @@ import { prisma } from "./prisma";
 import { IThinkClient } from "./ithink";
 import { DEFAULT_DETAIL_PROMPT_TEMPLATE, DEFAULT_MAIN_PROMPT_TEMPLATE, buildDetailPrompt, buildMainImagePrompt } from "./prompts";
 import { getImageDimensions, publicFileUrl } from "./storage";
+import { getAllowedScenesForUser } from "./scenes";
+import { retrieveKnowledge } from "./knowledge-retrieval";
+import { enhanceImagePrompt } from "./prompt-enhancement";
+import { getEffectiveDepartmentId, isAdmin } from "./dept-scope";
 
 export async function runTask(taskId: string) {
   const task = await prisma.generationTask.update({
@@ -9,6 +13,13 @@ export async function runTask(taskId: string) {
     data: { status: "generating", failureReason: null },
     include: { parse: { include: { items: { include: { matchedAsset: true } } } } }
   });
+
+  const taskUser = task.createdById
+    ? await prisma.user.findUnique({ where: { id: task.createdById } })
+    : null;
+  const knowledgeEnhancement = task.knowledgeEnhanced && taskUser
+    ? await loadKnowledgeEnhancement(taskUser, task.parse?.productSummary || task.parse?.rawMechanism || "")
+    : null;
 
   const config = await prisma.apiConfig.findUnique({ where: { id: "singleton" } });
   const client = new IThinkClient({
@@ -24,10 +35,24 @@ export async function runTask(taskId: string) {
       const quality = imageQuality(task.imageQuality);
       const mainPromptConfig = parseMainPromptConfig(task.prompt);
       const mainTemplateAsset = task.templateAssetId
-        ? await prisma.knowledgeAsset.findFirst({ where: { id: task.templateAssetId, assetType: "main_template", enabled: true } })
+        ? await prisma.knowledgeAsset.findFirst({
+            where: {
+              id: task.templateAssetId,
+              assetType: "main_template",
+              enabled: true,
+              ...(taskUser && !isAdmin(taskUser) ? { departmentId: getEffectiveDepartmentId(taskUser) } : {})
+            }
+          })
         : null;
       const portraitAsset = mainPromptConfig?.portraitAssetId
-        ? await prisma.knowledgeAsset.findFirst({ where: { id: mainPromptConfig.portraitAssetId, assetType: "portrait_white_image", enabled: true } })
+        ? await prisma.knowledgeAsset.findFirst({
+            where: {
+              id: mainPromptConfig.portraitAssetId,
+              assetType: "portrait_white_image",
+              enabled: true,
+              ...(taskUser && !isAdmin(taskUser) ? { departmentId: getEffectiveDepartmentId(taskUser) } : {})
+            }
+          })
         : null;
       const references = referenceImagesForMainTask(task.parse, mainTemplateAsset, portraitAsset);
       const referenceImagePaths = references.map((reference) => reference.storagePath);
@@ -35,7 +60,8 @@ export async function runTask(taskId: string) {
       const expectedDimensions = dimensionsFromSize(requestSize);
       const sizeWarnings: string[] = [];
       for (let index = 0; index < task.imageCount; index++) {
-        const prompt = resolveMainPrompt(mainPromptConfig?.template ?? task.prompt, task.parse, references);
+        const basePrompt = resolveMainPrompt(mainPromptConfig?.template ?? task.prompt, task.parse, references);
+        const prompt = knowledgeEnhancement ? enhanceImagePrompt(basePrompt, knowledgeEnhancement) : basePrompt;
         const imagePath = referenceImagePaths.length
           ? await client.editImage(prompt, requestSize, referenceImagePaths, quality)
           : await client.generateImage(prompt, size, quality);
@@ -61,7 +87,8 @@ export async function runTask(taskId: string) {
       const existingPages = new Set(existing.map((result) => result.pageIndex).filter((page): page is number => Boolean(page)));
       for (let page = 1; page <= count; page++) {
         if (existingPages.has(page)) continue;
-        const prompt = resolveDetailPrompt(task.prompt, task.parse, page, count, references);
+        const basePrompt = resolveDetailPrompt(task.prompt, task.parse, page, count, references);
+        const prompt = knowledgeEnhancement ? enhanceImagePrompt(basePrompt, knowledgeEnhancement) : basePrompt;
         const imagePath = referenceImagePaths.length
           ? await client.editImage(prompt, size, referenceImagePaths, quality)
           : await client.generateImage(prompt, size, quality);
@@ -285,4 +312,24 @@ function sizeMismatchWarning(expected: { width?: number; height?: number }, actu
   if (!expected.width || !expected.height || !actual.width || !actual.height) return "";
   if (expected.width === actual.width && expected.height === actual.height) return "";
   return `上游返回尺寸与请求不一致：请求 ${expected.width}x${expected.height}，实际 ${actual.width}x${actual.height}`;
+}
+
+async function loadKnowledgeEnhancement(
+  user: { id: string; role: string; departmentId: string | null },
+  query: string
+) {
+  try {
+    if (!query || !query.trim()) return null;
+    const allowedScenes = await getAllowedScenesForUser(user);
+    const ranked = await retrieveKnowledge({
+      userDepartmentId: getEffectiveDepartmentId(user),
+      isAdmin: isAdmin(user),
+      allowedScenes,
+      query
+    });
+    return ranked.length ? ranked : null;
+  } catch (error) {
+    console.warn("[generation] knowledge enhancement failed, falling back to base prompt", error);
+    return null;
+  }
 }

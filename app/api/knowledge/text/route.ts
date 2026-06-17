@@ -4,6 +4,8 @@ import { NextResponse } from "next/server";
 import { canEdit, jsonError, requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { publicFileUrl, safeFileName, uploadDir, ensureStorage } from "@/lib/storage";
+import { getEffectiveDepartmentId, isAdmin } from "@/lib/dept-scope";
+import { serializeScenes } from "@/lib/scenes";
 
 export async function POST(request: Request) {
   try {
@@ -16,6 +18,10 @@ export async function POST(request: Request) {
     if (!assetName) throw Object.assign(new Error("请输入资料名称"), { status: 400 });
     if (!text) throw Object.assign(new Error("请输入要保存的文字内容"), { status: 400 });
     if (assetType !== "document" && assetType !== "prompt") throw Object.assign(new Error("文字资料类型仅支持文档或提示词"), { status: 400 });
+
+    const requestedDept = body.departmentId ? String(body.departmentId) : "";
+    const departmentId = isAdmin(user) && requestedDept ? requestedDept : getEffectiveDepartmentId(user);
+    const scenes = serializeScenes(Array.isArray(body.scenes) ? body.scenes.map(String) : []);
 
     await ensureStorage();
     const fileName = `${Date.now()}-${safeFileName(assetName)}.txt`;
@@ -30,6 +36,8 @@ export async function POST(request: Request) {
         mimeType: "text/plain",
         extractedText: text,
         description: body.description ? String(body.description) : null,
+        departmentId,
+        scenes,
         createdById: user.id
       }
     });

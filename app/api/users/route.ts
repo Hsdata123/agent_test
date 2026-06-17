@@ -20,6 +20,7 @@ export async function GET(request: Request) {
         nickname: true,
         role: true,
         status: true,
+        departmentId: true,
         createdAt: true,
         lastLoginAt: true
       }
@@ -33,7 +34,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     await requireAdmin();
-    const { username, nickname, password, role } = await request.json();
+    const { username, nickname, password, role, departmentId } = await request.json();
     if (!username || !password) throw Object.assign(new Error("账号和密码必填"), { status: 400 });
     const roleKey = role || "creator";
     if (!(await getRole(roleKey))) throw Object.assign(new Error("角色不存在，请先在角色设定中创建"), { status: 400 });
@@ -42,9 +43,10 @@ export async function POST(request: Request) {
         username,
         nickname: nickname || username,
         passwordHash: hashPassword(password),
-        role: roleKey
+        role: roleKey,
+        departmentId: departmentId ? String(departmentId) : null
       },
-      select: { id: true, username: true, nickname: true, role: true, status: true }
+      select: { id: true, username: true, nickname: true, role: true, status: true, departmentId: true }
     });
     return NextResponse.json({ success: true, user });
   } catch (error) {

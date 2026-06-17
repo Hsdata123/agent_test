@@ -1,12 +1,29 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { basename } from "node:path";
 import { jsonError, requireUser } from "@/lib/auth";
 import { ensureChatWorkspaceTables, getChatConversationForUser } from "@/lib/chat-store";
-import { extractDocumentText } from "@/lib/document-extract";
 import { IThinkClient } from "@/lib/ithink";
 import { prisma } from "@/lib/prisma";
+import { detectSceneIntent } from "@/lib/scene-intent";
+import { getEffectiveDepartmentId, isAdmin } from "@/lib/dept-scope";
+import { listOpenAITools } from "@/lib/skills/registry";
+import type { ToolDefinition } from "@/lib/ithink";
+import { refreshAssetsText } from "@/lib/asset-extract";
+import { runChatWithSkills } from "@/lib/chat-runner";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+type ProcessEvent =
+  | { type: "manual_mode"; count: number }
+  | { type: "intent"; scenes: Array<{ sceneKey: string; sceneName: string; score: number }> }
+  | { type: "retrieve"; assets: Array<{ id: string; assetName: string; assetType: string; score: number }>; contextChars: number; contextPreview: string }
+  | { type: "skill"; calls: Array<{ id: string; name: string; arguments: unknown; result: string; ok: boolean; error?: string; meta?: Record<string, unknown> }>; contextChars: number }
+  | { type: "context"; chars: number; preview: string; fullContext: string }
+  | { type: "text"; text: string }
+  | { type: "usage"; promptTokens?: number; completionTokens?: number; totalTokens?: number; cachedTokens?: number }
+  | { type: "done"; answer: string; usedAssets: Array<{ id: string; assetName: string; assetType: string }>; debug: Record<string, unknown> }
+  | { type: "error"; error: string; details?: Record<string, unknown> };
 
 export async function POST(request: Request) {
   try {
@@ -14,6 +31,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     const message = String(body.message || "").trim();
     const useAll = Boolean(body.useAll);
+    const useKnowledge = body.useKnowledge === true;
     const assetIds = Array.isArray(body.assetIds) ? body.assetIds.map(String) : [];
     const assetType = String(body.assetType || "all");
     const conversationId = String(body.conversationId || "");
@@ -21,94 +39,215 @@ export async function POST(request: Request) {
     const conversation = conversationId ? await getChatConversationForUser(conversationId, user.id) : null;
     if (conversationId && !conversation) throw Object.assign(new Error("对话不存在或无权限访问"), { status: 404 });
 
-    const selectedKnowledge = assetIds.length > 0;
-    const messageWantsKnowledge = shouldUseKnowledgeFromMessage(message);
-    const shouldUseKnowledge = useAll || selectedKnowledge || messageWantsKnowledge;
-    const typeWhere = assetType && assetType !== "all" ? { assetType } : {};
-    const assets = shouldUseKnowledge
-      ? await prisma.knowledgeAsset.findMany({
-          where: useAll || messageWantsKnowledge ? { enabled: true, ...typeWhere } : { id: { in: assetIds }, enabled: true, ...typeWhere },
-          orderBy: { updatedAt: "desc" },
-          take: useAll || messageWantsKnowledge ? 80 : 20
-        })
-      : [];
-    const refreshedAssets = shouldUseKnowledge ? await refreshExtractedText(assets) : assets;
-    const context = refreshedAssets
-      .map((asset, index) =>
-        [
-          `资料${index + 1}：${asset.assetName}`,
-          `类型：${asset.assetType}`,
-          asset.productName ? `产品：${asset.productName}` : "",
-          asset.description ? `说明：${asset.description}` : "",
-          asset.extractedText ? `正文：${asset.extractedText.slice(0, 8000)}` : ""
-        ]
-          .filter(Boolean)
-          .join("\n")
-      )
-      .join("\n\n");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        const send = (event: ProcessEvent) => {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          } catch {
+            // stream closed
+          }
+        };
 
-    const config = await prisma.apiConfig.findUnique({ where: { id: "singleton" } });
-    const client = new IThinkClient({
-      apiKey: process.env.ITHINK_TEXT_API_KEY,
-      baseUrl: config?.textBaseUrl || config?.imageBaseUrl,
-      imageModel: config?.imageModel,
-      chatModel: config?.textModel,
-      timeoutSeconds: config?.timeoutSeconds,
-      textWireApi: config?.textWireApi,
-      textPromptCacheEnabled: config?.textPromptCacheEnabled,
-      textPromptCacheRetention: config?.textPromptCacheRetention,
-      textPromptCacheKey: config?.textPromptCacheKey,
-      disableResponseStorage: config?.disableResponseStorage
+        try {
+          const selectedKnowledge = assetIds.length > 0;
+          const messageWantsKnowledge = shouldUseKnowledgeFromMessage(message);
+          const shouldUseLegacy = useAll || selectedKnowledge || messageWantsKnowledge;
+          const typeWhere = assetType && assetType !== "all" ? { assetType } : {};
+
+          let context: string | undefined;
+          const usedAssetSummaries: Array<{ id: string; assetName: string; assetType: string }> = [];
+          const seen = new Set<string>();
+          const pushAsset = (asset: { id: string; assetName: string; assetType: string }) => {
+            if (seen.has(asset.id)) return;
+            seen.add(asset.id);
+            usedAssetSummaries.push(asset);
+          };
+
+          let usedPath: "manual" | "auto" | "skill" | "none" = "none";
+          let intentScenes: Array<{ sceneKey: string; sceneName: string; score: number }> = [];
+          let retrievedDebug: Array<{ id: string; assetName: string; assetType: string; score: number; scenes: string[] }> = [];
+
+          // 路径 A：手动选择（useAll 或 显式 assetIds 或 消息关键词）
+          if (shouldUseLegacy) {
+            const assets = await prisma.knowledgeAsset.findMany({
+              where: useAll || messageWantsKnowledge ? { enabled: true, ...typeWhere } : { id: { in: assetIds }, enabled: true, ...typeWhere },
+              orderBy: { updatedAt: "desc" },
+              take: useAll || messageWantsKnowledge ? 80 : 20
+            });
+            const refreshed = await refreshAssetsText(assets);
+            for (const asset of refreshed) {
+              pushAsset({ id: asset.id, assetName: asset.assetName, assetType: asset.assetType });
+            }
+            const baseContext = refreshed
+              .map((asset, index) =>
+                [
+                  `资料${index + 1}：${asset.assetName}`,
+                  `类型：${asset.assetType}`,
+                  asset.productName ? `产品：${asset.productName}` : "",
+                  asset.description ? `说明：${asset.description}` : "",
+                  asset.extractedText ? `正文：${asset.extractedText}` : ""
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+              )
+              .join("\n\n");
+            context = baseContext;
+            usedPath = "manual";
+            send({ type: "manual_mode", count: refreshed.length });
+            send({ type: "context", chars: context.length, preview: context.slice(0, 1500), fullContext: context });
+          }
+
+          // 路径 B：技能调用（useKnowledge 开 + 没手动选）
+          let toolDefinitions: ToolDefinition[] = [];
+          if (useKnowledge && !shouldUseLegacy) {
+            const { scenes } = await detectSceneIntent({
+              userDepartmentId: getEffectiveDepartmentId(user),
+              isAdmin: isAdmin(user),
+              query: message
+            });
+            intentScenes = scenes.map((s) => ({ sceneKey: s.sceneKey, sceneName: s.sceneName, score: s.score }));
+            if (scenes.length) {
+              send({ type: "intent", scenes: intentScenes });
+            }
+            toolDefinitions = await listOpenAITools();
+            usedPath = "skill";
+          }
+
+          const config = await prisma.apiConfig.findUnique({ where: { id: "singleton" } });
+          const client = new IThinkClient({
+            apiKey: process.env.ITHINK_TEXT_API_KEY,
+            baseUrl: config?.textBaseUrl || config?.imageBaseUrl,
+            imageModel: config?.imageModel,
+            chatModel: config?.textModel,
+            timeoutSeconds: config?.timeoutSeconds,
+            textWireApi: config?.textWireApi,
+            textPromptCacheEnabled: config?.textPromptCacheEnabled,
+            textPromptCacheRetention: config?.textPromptCacheRetention,
+            textPromptCacheKey: config?.textPromptCacheKey,
+            disableResponseStorage: config?.disableResponseStorage
+          });
+          const history = conversation ? await loadConversationHistory(conversation.id) : [];
+          const runnerResult = await runChatWithSkills(
+            {
+              client,
+              message,
+              history,
+              context,
+              tools: toolDefinitions.length ? toolDefinitions : undefined,
+              ctx: { user },
+              isSkillPath: usedPath === "skill"
+            },
+            (chunk) => {
+              if (chunk.type === "text") {
+                send({ type: "text", text: chunk.text });
+              } else if (chunk.type === "skill") {
+                const skillEvents = chunk.calls.map((call) => ({
+                  id: call.id,
+                  name: call.name,
+                  arguments: call.arguments,
+                  result: call.ok ? call.result : `执行失败：${call.error}`,
+                  ok: call.ok,
+                  error: call.error,
+                  meta: call.meta
+                }));
+                send({ type: "skill", calls: skillEvents, contextChars: chunk.contextChars });
+                for (const call of chunk.calls) {
+                  const assets = call.matchedAssets || [];
+                  for (const asset of assets) {
+                    pushAsset({ id: asset.id, assetName: asset.assetName, assetType: asset.assetType });
+                  }
+                }
+              } else if (chunk.type === "usage") {
+                send({
+                  type: "usage",
+                  promptTokens: chunk.usage.promptTokens,
+                  completionTokens: chunk.usage.completionTokens,
+                  totalTokens: chunk.usage.totalTokens,
+                  cachedTokens: chunk.usage.cachedTokens
+                });
+              }
+            }
+          );
+
+          if (runnerResult.error) {
+            send({ type: "error", error: runnerResult.error.error, details: runnerResult.error.details });
+            controller.close();
+            return;
+          }
+
+          const answer = runnerResult.answer || "（模型未返回内容）";
+          if (runnerResult.skillContext) {
+            send({
+              type: "context",
+              chars: runnerResult.skillContext.length,
+              preview: runnerResult.skillContext.slice(0, 1500),
+              fullContext: runnerResult.skillContext
+            });
+          }
+          if (conversation) {
+            await appendConversationMessages(conversation.id, conversation.projectId, message, answer);
+          }
+          await recordChatUsage({
+            userId: user.id,
+            message,
+            answer,
+            promptTokens: runnerResult.usage.promptTokens,
+            completionTokens: runnerResult.usage.completionTokens,
+            totalTokens: runnerResult.usage.totalTokens,
+            cachedTokens: runnerResult.usage.cachedTokens
+          });
+          if (runnerResult.usage.promptTokens !== undefined || runnerResult.usage.completionTokens !== undefined) {
+            send({
+              type: "usage",
+              promptTokens: runnerResult.usage.promptTokens,
+              completionTokens: runnerResult.usage.completionTokens,
+              totalTokens: runnerResult.usage.totalTokens,
+              cachedTokens: runnerResult.usage.cachedTokens
+            });
+          }
+          const contextPreview = (runnerResult.skillContext || context || "").slice(0, 1500);
+          send({
+            type: "done",
+            answer,
+            usedAssets: usedAssetSummaries,
+            debug: {
+              useKnowledgeSwitch: useKnowledge,
+              usedPath,
+              intentScenes,
+              ranked: retrievedDebug,
+              baseAssetCount: usedPath === "manual" ? usedAssetSummaries.length : 0,
+              contextCharCount: runnerResult.skillContext.length || context?.length || 0,
+              contextPreview,
+              skillCalls: runnerResult.skillCalls
+            }
+          });
+          controller.close();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const details =
+            error && typeof error === "object" && "toJSON" in error
+              ? ((error as { toJSON(): unknown }).toJSON() as Record<string, unknown>)
+              : undefined;
+          console.error("[chat] request failed", { message, details, stack: error instanceof Error ? error.stack : undefined });
+          send({ type: "error", error: message, details });
+          controller.close();
+        }
+      }
     });
-    const history = conversation ? await loadConversationHistory(conversation.id) : [];
-    const chatResult = await client.chatDetailed(message, shouldUseKnowledge ? context : undefined, history);
-    const answer = chatResult.content;
-    if (conversation) {
-      await appendConversationMessages(conversation.id, conversation.projectId, message, answer);
-    }
-    await recordChatUsage({
-      userId: user.id,
-      message,
-      answer,
-      promptTokens: chatResult.usage?.prompt_tokens,
-      completionTokens: chatResult.usage?.completion_tokens,
-      totalTokens: chatResult.usage?.total_tokens,
-      cachedTokens: chatResult.usage?.cached_tokens
-    });
-    return NextResponse.json({
-      success: true,
-      answer,
-      usedAssets: refreshedAssets.map((asset) => ({ id: asset.id, assetName: asset.assetName, assetType: asset.assetType }))
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no"
+      }
     });
   } catch (error) {
     return jsonError(error);
   }
-}
-
-async function refreshExtractedText<T extends { id: string; originalName: string; storagePath: string; mimeType: string | null; extractedText: string | null }>(
-  assets: T[]
-) {
-  return Promise.all(
-    assets.map(async (asset) => {
-      if (!needsReextract(asset.extractedText)) return asset;
-      try {
-        const buffer = await readFile(asset.storagePath);
-        const originalName = asset.originalName || basename(asset.storagePath);
-        const file = new File([buffer], originalName, { type: asset.mimeType || "" });
-        const extractedText = await extractDocumentText(file, originalName);
-        if (!extractedText || extractedText === asset.extractedText) return asset;
-        await prisma.knowledgeAsset.update({ where: { id: asset.id }, data: { extractedText } });
-        return { ...asset, extractedText };
-      } catch {
-        return asset;
-      }
-    })
-  );
-}
-
-function needsReextract(text: string | null) {
-  if (!text) return true;
-  return text.includes("暂不解析二进制全文") || text.includes("当前本地测试版已把该文件作为对话资料保存");
 }
 
 function shouldUseKnowledgeFromMessage(message: string) {
@@ -158,7 +297,7 @@ async function appendConversationMessages(conversationId: string, projectId: str
   const title = titleRows[0]?.title;
   const messageCount = Number(titleRows[0]?.messageCount || 0);
   const nextTitle = title === "新对话" && messageCount <= 2 ? message.slice(0, 32) || "新对话" : title;
-  await prisma.$executeRawUnsafe(`UPDATE ChatConversation SET title = ?, updatedAt = ? WHERE id = ?`, nextTitle, now, conversationId);
+  await prisma.$executeRawUnsafe(`UPDATE ChatConversation SET title = ?, updatedAt = ? WHERE id = ?`, nextTitle, now, projectId);
   await prisma.$executeRawUnsafe(`UPDATE ChatProject SET updatedAt = ? WHERE id = ?`, now, projectId);
 }
 
@@ -220,4 +359,15 @@ function estimateChatCost(promptTokens: number, completionTokens: number) {
   const inputCostPerThousand = 0.002;
   const outputCostPerThousand = 0.008;
   return Number(((promptTokens / 1000) * inputCostPerThousand + (completionTokens / 1000) * outputCostPerThousand).toFixed(6));
+}
+
+function parseScenesForDebug(value: string | string[] | null | undefined): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
 }

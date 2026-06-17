@@ -47,6 +47,16 @@ export async function requireAdmin() {
   return user;
 }
 
+export async function requireDeptAdmin(targetDepartmentId?: string | null) {
+  const user = await requireUser();
+  if (user.role === "admin") return user;
+  if (await roleHasPermission(user.role, "manage_settings")) return user;
+  if (user.role === "creator" && user.departmentId && (!targetDepartmentId || targetDepartmentId === user.departmentId)) {
+    return user;
+  }
+  throw Object.assign(new Error("无权限管理部门/场景配置"), { status: 403 });
+}
+
 export async function canEdit(role: string) {
   return role === "admin" || role === "creator" || role === "editor" || (await roleHasPermission(role, "generate_image"));
 }

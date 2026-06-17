@@ -203,6 +203,49 @@ CREATE TABLE IF NOT EXISTS ChatMessage (
   createdAt DATETIME NOT NULL,
   CONSTRAINT ChatMessage_conversationId_fkey FOREIGN KEY (conversationId) REFERENCES ChatConversation (id) ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS Department (
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL UNIQUE,
+  code TEXT UNIQUE,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  createdAt DATETIME NOT NULL,
+  updatedAt DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS BusinessScene (
+  id TEXT PRIMARY KEY NOT NULL,
+  departmentId TEXT NOT NULL,
+  sceneKey TEXT NOT NULL,
+  sceneName TEXT NOT NULL,
+  description TEXT,
+  createdAt DATETIME NOT NULL,
+  updatedAt DATETIME NOT NULL,
+  CONSTRAINT BusinessScene_departmentId_fkey FOREIGN KEY (departmentId) REFERENCES Department (id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS BusinessScene_departmentId_sceneKey_key ON BusinessScene(departmentId, sceneKey);
+
+CREATE TABLE IF NOT EXISTS Skill (
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL UNIQUE,
+  displayName TEXT NOT NULL,
+  description TEXT NOT NULL,
+  parameters TEXT NOT NULL DEFAULT '{"type":"object","properties":{},"required":[]}',
+  executeMode TEXT NOT NULL DEFAULT 'search_kb',
+  executeConfig TEXT NOT NULL DEFAULT '{}',
+  systemPrompt TEXT,
+  enabled BOOLEAN NOT NULL DEFAULT 1,
+  departmentId TEXT,
+  createdById TEXT,
+  createdAt DATETIME NOT NULL,
+  updatedAt DATETIME NOT NULL,
+  deletedAt DATETIME,
+  CONSTRAINT Skill_departmentId_fkey FOREIGN KEY (departmentId) REFERENCES Department (id) ON DELETE SET NULL ON UPDATE CASCADE,
+  CONSTRAINT Skill_createdById_fkey FOREIGN KEY (createdById) REFERENCES User (id) ON DELETE SET NULL ON UPDATE CASCADE
+);
+CREATE INDEX IF NOT EXISTS Skill_departmentId_idx ON Skill(departmentId);
+CREATE INDEX IF NOT EXISTS Skill_deletedAt_idx ON Skill(deletedAt);
 `);
 
 function ensureColumn(table, column, definition) {
@@ -215,12 +258,28 @@ function ensureColumn(table, column, definition) {
 ensureColumn("GenerationTask", "templateAssetId", "TEXT");
 ensureColumn("GenerationTask", "imageSize", "TEXT");
 ensureColumn("GenerationTask", "imageQuality", "TEXT");
+ensureColumn("GenerationTask", "knowledgeEnhanced", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("ApiConfig", "textWireApi", "TEXT NOT NULL DEFAULT 'responses'");
 ensureColumn("ApiConfig", "textPromptCacheEnabled", "BOOLEAN NOT NULL DEFAULT 1");
 ensureColumn("ApiConfig", "textPromptCacheRetention", "TEXT NOT NULL DEFAULT '24h'");
 ensureColumn("ApiConfig", "textPromptCacheKey", "TEXT NOT NULL DEFAULT 'commerce-chat'");
 ensureColumn("ApiConfig", "disableResponseStorage", "BOOLEAN NOT NULL DEFAULT 1");
 ensureColumn("ChatUsage", "cachedTokens", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("User", "departmentId", "TEXT");
+ensureColumn("KnowledgeAsset", "departmentId", "TEXT");
+ensureColumn("KnowledgeAsset", "scenes", "TEXT NOT NULL DEFAULT '[]'");
+
+const defaultDeptRow = db.prepare("SELECT id FROM Department WHERE id = ?").get("dept_default");
+if (!defaultDeptRow) {
+  const now = new Date().toISOString();
+  db.prepare(
+    "INSERT INTO Department (id, name, code, description, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run("dept_default", "默认部门", "default", "系统初始部门，可重命名或新增其他部门", "active", now, now);
+}
+
+db.exec("UPDATE User SET departmentId = 'dept_default' WHERE departmentId IS NULL");
+db.exec("UPDATE KnowledgeAsset SET departmentId = 'dept_default' WHERE departmentId IS NULL");
+db.exec("UPDATE KnowledgeAsset SET scenes = '[]' WHERE scenes IS NULL OR scenes = ''");
 
 db.close();
 console.log(`SQLite database is ready: ${dbPath}`);

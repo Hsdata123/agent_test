@@ -12,6 +12,90 @@ type TextWireApi = "auto" | "chat" | "responses";
 type ChatHistoryMessage = { role: "user" | "assistant"; content: string };
 type ChatParseResult = { content: string; usage?: ChatUsage; missingContent?: boolean; cachedTokens?: number };
 
+export type ToolDefinition = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+};
+
+export type ToolCallAccumulator = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+
+export type ChatStreamChunk =
+  | { type: "text"; text: string }
+  | { type: "tool_calls"; calls: ToolCallAccumulator[] }
+  | { type: "usage"; usage: ChatUsage }
+  | { type: "error"; error: string; details?: ApiErrorDetails };
+
+export type ChatStreamOptions = {
+  tools?: ToolDefinition[];
+  toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
+  messages?: Array<Record<string, unknown>>;
+};
+
+export type ChatMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content?: string | null;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+};
+
+export type ApiErrorDetails = {
+  message: string;
+  status: number;
+  url?: string;
+  type?: string;
+  code?: string;
+  param?: string;
+  requestId?: string;
+  bodySnippet?: string;
+};
+
+export class IThinkApiError extends Error {
+  status: number;
+  url?: string;
+  type?: string;
+  code?: string;
+  param?: string;
+  requestId?: string;
+  bodySnippet?: string;
+  constructor(details: ApiErrorDetails) {
+    super(details.message);
+    this.name = "IThinkApiError";
+    this.status = details.status;
+    this.url = details.url;
+    this.type = details.type;
+    this.code = details.code;
+    this.param = details.param;
+    this.requestId = details.requestId;
+    this.bodySnippet = details.bodySnippet;
+  }
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      status: this.status,
+      url: this.url,
+      type: this.type,
+      code: this.code,
+      param: this.param,
+      requestId: this.requestId,
+      bodySnippet: this.bodySnippet
+    };
+  }
+}
+
 export class IThinkClient {
   private apiKey: string;
   private baseUrl: string;
@@ -103,6 +187,175 @@ export class IThinkClient {
     return (await this.chatDetailed(message, knowledgeContext)).content;
   }
 
+  async *chatStream(
+    message: string,
+    knowledgeContext?: string,
+    history: ChatHistoryMessage[] = [],
+    options?: ChatStreamOptions
+  ): AsyncGenerator<ChatStreamChunk> {
+    const systemPrompt = knowledgeContext
+      ? `你是电商视觉与内容助手。请优先依据用户选中的知识库资料回答；如果资料不足，请明确说明缺少哪些信息。\n\n知识库资料：\n${knowledgeContext}`
+      : "你是电商视觉与内容助手。请直接回答用户问题；只有用户明确要求参考知识库时，才说明需要选择或调用知识库资料。";
+    const messages = options?.messages
+      ? options.messages
+      : [
+          { role: "system" as const, content: systemPrompt },
+          ...history.map((item) => ({ role: item.role, content: item.content })),
+          { role: "user" as const, content: message }
+        ];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      if (this.prefersResponses()) {
+        const response = await fetch(this.responsesUrl(), {
+          method: "POST",
+          headers: this.jsonHeaders(),
+          signal: controller.signal,
+          body: JSON.stringify({
+            model: this.chatModel,
+            ...(this.disableResponseStorage ? { store: false } : {}),
+            instructions: systemPrompt,
+            input: responsesInput(history, message),
+            max_output_tokens: 2048,
+            stream: true,
+            ...this.cacheOptions()
+          })
+        });
+        if (!response.ok) {
+          const err = normalizeApiError(await response.text(), response.status, this.responsesUrl());
+          yield yieldApiError(err);
+          return;
+        }
+        const reader = response.body?.getReader();
+        if (!reader) {
+          yield { type: "error", error: "上游未返回流", details: { message: "上游未返回流", status: 502, url: this.responsesUrl() } };
+          return;
+        }
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalUsage: ChatUsage | undefined;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            const data = trimmed.slice(5).trim();
+            if (!data || data === "[DONE]") continue;
+            try {
+              const payload = JSON.parse(data);
+              const text = extractChatText(payload);
+              if (text) yield { type: "text", text };
+              const usage = extractChatUsage(payload);
+              if (usage) finalUsage = usage;
+            } catch {
+              // ignore parse errors
+            }
+          }
+        }
+        if (finalUsage) yield { type: "usage", usage: finalUsage };
+        return;
+      }
+
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: this.jsonHeaders(),
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: this.chatModel,
+          messages,
+          ...(options?.tools && options.tools.length
+            ? { tools: options.tools, tool_choice: options.toolChoice || "auto" }
+            : {}),
+          stream: true,
+          max_completion_tokens: 2048,
+          ...this.cacheOptions()
+        })
+      });
+      if (!response.ok) {
+        const err = normalizeApiError(await response.text(), response.status, `${this.baseUrl}/chat/completions`);
+        yield yieldApiError(err);
+        return;
+      }
+      const reader = response.body?.getReader();
+      if (!reader) {
+        yield { type: "error", error: "上游未返回流", details: { message: "上游未返回流", status: 502, url: `${this.baseUrl}/chat/completions` } };
+        return;
+      }
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalUsage: ChatUsage | undefined;
+      const toolCallMap = new Map<number, ToolCallAccumulator>();
+      let sawToolFinish = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const data = trimmed.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          try {
+            const payload = JSON.parse(data);
+            const choice = payload?.choices?.[0];
+            const finishReason = choice?.finish_reason;
+            if (finishReason === "tool_calls") sawToolFinish = true;
+            const delta = choice?.delta || {};
+            const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+            for (const call of toolCalls) {
+              const index = typeof call.index === "number" ? call.index : 0;
+              const existing = toolCallMap.get(index) || { id: "", name: "", arguments: "" };
+              if (call.id) existing.id = call.id;
+              if (call.function?.name) existing.name = call.function.name;
+              if (typeof call.function?.arguments === "string") existing.arguments += call.function.arguments;
+              toolCallMap.set(index, existing);
+            }
+            const text = extractChatText({ delta });
+            if (text) yield { type: "text", text };
+            const usage = extractChatUsage(payload);
+            if (usage) finalUsage = usage;
+          } catch {
+            // ignore parse errors
+          }
+        }
+      }
+      if (toolCallMap.size) {
+        yield {
+          type: "tool_calls",
+          calls: Array.from(toolCallMap.values()).map((call) => ({
+            id: call.id,
+            name: call.name,
+            arguments: call.arguments
+          }))
+        };
+      } else if (sawToolFinish) {
+        // 极少数流：上游只发了 finish_reason 但没把 tool_calls 增量带回来，尝试从尾部 buffer 再补一次解析
+        const tail = collectToolCallsFromTail(buffer);
+        if (tail.length) yield { type: "tool_calls", calls: tail };
+      }
+      if (finalUsage) yield { type: "usage", usage: finalUsage };
+    } catch (error) {
+      if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
+        yield { type: "error", error: `聊天 API 请求超时：超过 ${Math.round(this.timeoutMs / 1000)} 秒未返回。`, details: { message: `聊天 API 请求超时：超过 ${Math.round(this.timeoutMs / 1000)} 秒未返回。`, status: 408 } };
+        return;
+      }
+      if (error instanceof IThinkApiError) {
+        yield yieldApiError(error);
+        return;
+      }
+      const networkDetails = extractNetworkErrorDetails(error);
+      yield { type: "error", error: error instanceof Error ? error.message : String(error), details: networkDetails };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async chat(message: string) {
     return (await this.chatDetailed(message)).content;
   }
@@ -136,11 +389,12 @@ export class IThinkClient {
           ...this.cacheOptions()
         })
       });
-      if (!response.ok) throw new Error(normalizeApiError(await response.text()));
+      if (!response.ok) throw normalizeApiError(await response.text(), response.status, `${this.baseUrl}/chat/completions`);
       const result = parseChatCompletionPayload(await response.text());
       if (!looksLikeMissingChatContent(result.content)) return result;
       return await this.chatDetailedViaResponses(message, systemPrompt, history);
     } catch (error) {
+      if (error instanceof IThinkApiError) throw error;
       if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
         throw new Error(`聊天 API 请求超时：超过 ${Math.round(this.timeoutMs / 1000)} 秒未返回。`);
       }
@@ -163,7 +417,7 @@ export class IThinkClient {
         ...this.cacheOptions()
       })
     });
-    if (!response.ok) throw new Error(normalizeApiError(await response.text()));
+    if (!response.ok) throw normalizeApiError(await response.text(), response.status, this.responsesUrl());
     const raw = await response.text();
     const result = parseChatCompletionPayload(raw);
     if (!looksLikeMissingChatContent(result.content)) return result;
@@ -229,10 +483,11 @@ export class IThinkClient {
         })
       });
       if (!response.ok) {
-        throw new Error(normalizeApiError(await response.text()));
+        throw normalizeApiError(await response.text(), response.status, `${this.baseUrl}/images/generations`);
       }
       return saveImageResponse(await response.json());
       } catch (error) {
+        if (error instanceof IThinkApiError) throw error;
         if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
           throw new Error(`图片 API 请求超时：单张图片超过 ${Math.round(this.timeoutMs / 1000)} 秒未返回。可在设置页调大超时时间后重试。`);
         }
@@ -272,10 +527,11 @@ export class IThinkClient {
         body: form
       });
       if (!response.ok) {
-        throw new Error(normalizeApiError(await response.text()));
+        throw normalizeApiError(await response.text(), response.status, `${this.baseUrl}/images/edits`);
       }
       return saveImageResponse(await response.json());
       } catch (error) {
+        if (error instanceof IThinkApiError) throw error;
         if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
           throw new Error(`图片编辑 API 请求超时：单张图片超过 ${Math.round(this.timeoutMs / 1000)} 秒未返回。可在设置页调大超时时间后重试。`);
         }
@@ -388,6 +644,34 @@ function looksLikeMissingChatContent(content: string) {
   );
 }
 
+function collectToolCallsFromTail(buffer: string): ToolCallAccumulator[] {
+  if (!buffer) return [];
+  const map = new Map<number, ToolCallAccumulator>();
+  for (const line of buffer.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    let payload: any;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    const choice = payload?.choices?.[0];
+    const toolCalls = Array.isArray(choice?.delta?.tool_calls) ? choice.delta.tool_calls : [];
+    for (const call of toolCalls) {
+      const index = typeof call.index === "number" ? call.index : 0;
+      const existing = map.get(index) || { id: "", name: "", arguments: "" };
+      if (call.id) existing.id = call.id;
+      if (call.function?.name) existing.name = call.function.name;
+      if (typeof call.function?.arguments === "string") existing.arguments += call.function.arguments;
+      map.set(index, existing);
+    }
+  }
+  return Array.from(map.values());
+}
+
 function responsesInput(history: ChatHistoryMessage[], message: string) {
   return [
     ...history
@@ -477,22 +761,56 @@ function mimeFromPath(filePath: string) {
   return "image/png";
 }
 
-function normalizeApiError(raw: string) {
+function normalizeApiError(raw: string, status: number, url: string): IThinkApiError {
+  const snippet = raw ? raw.slice(0, 2000) : "";
+  let payload: any = null;
   try {
-    const payload = JSON.parse(raw);
-    const error = payload.error;
-    const message = String(error?.message || raw);
-    const code = String(error?.code || "");
-    if (code === "insufficient_user_quota" || message.includes("额度")) {
-      return `图片 API 额度不足：${message}`;
-    }
-    return message;
+    payload = JSON.parse(raw);
   } catch {
-    return raw || "图片 API 调用失败";
+    // not JSON
   }
+  const error = payload?.error;
+  const message = String(
+    error?.message ||
+      payload?.message ||
+      (raw ? raw.slice(0, 500) : "") ||
+      "上游 API 调用失败"
+  );
+  const code = error?.code ? String(error.code) : undefined;
+  const type = error?.type ? String(error.type) : undefined;
+  const param = error?.param ? String(error.param) : undefined;
+  const requestId = payload?.request_id || payload?.requestId || error?.request_id || error?.requestId || error?.trace_id
+    ? String(payload?.request_id || payload?.requestId || error?.request_id || error?.requestId || error?.trace_id)
+    : undefined;
+  let finalMessage = message;
+  if (code === "insufficient_user_quota" || message.includes("额度")) {
+    finalMessage = `图片 API 额度不足：${message}`;
+  }
+  return new IThinkApiError({
+    message: finalMessage,
+    status,
+    url,
+    type,
+    code,
+    param,
+    requestId,
+    bodySnippet: snippet
+  });
 }
 
 function isRetryableImageError(error: unknown) {
+  if (error instanceof IThinkApiError) {
+    if (error.status >= 500 && error.status < 600) return true;
+    const message = error.message;
+    return (
+      message.includes("系统繁忙") ||
+      message.includes("稍后再试") ||
+      message.includes("traceid") ||
+      message.includes("timeout") ||
+      message.includes("ETIMEDOUT") ||
+      message.includes("ECONNRESET")
+    );
+  }
   const message = error instanceof Error ? error.message : String(error);
   return (
     message.includes("系统繁忙") ||
@@ -503,6 +821,25 @@ function isRetryableImageError(error: unknown) {
     message.includes("ECONNRESET") ||
     /^5\d\d\b/.test(message)
   );
+}
+
+function yieldApiError(err: IThinkApiError) {
+  console.error("[ithink] upstream error", err.toJSON());
+  return { type: "error" as const, error: err.message, details: err.toJSON() };
+}
+
+function extractNetworkErrorDetails(error: unknown): ApiErrorDetails {
+  if (!(error instanceof Error)) return { message: String(error), status: 0 };
+  const anyErr = error as Error & { cause?: any; code?: string };
+  const causeCode = anyErr.cause?.code || anyErr.code;
+  const causeAddr = anyErr.cause?.address || anyErr.cause?.hostname;
+  return {
+    message: error.message,
+    status: 0,
+    code: causeCode ? String(causeCode) : undefined,
+    type: causeCode ? "NetworkError" : undefined,
+    param: causeAddr ? String(causeAddr) : undefined
+  };
 }
 
 function sleep(ms: number) {

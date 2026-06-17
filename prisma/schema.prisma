@@ -14,16 +14,19 @@ model User {
   passwordHash String
   role         String     @default("creator")
   status       String     @default("active")
+  departmentId String?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   lastLoginAt  DateTime?
 
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
   projects     Project[]          @relation("ProjectCreator")
   memberships  ProjectMember[]
   assets       KnowledgeAsset[]
   parses       MechanismParse[]
   tasks        GenerationTask[]
   sessions     Session[]
+  skills       Skill[]
 }
 
 model Session {
@@ -81,11 +84,14 @@ model KnowledgeAsset {
   preferred      Boolean      @default(false)
   vectorStatus   String       @default("pending")
   extractedText  String?
+  departmentId   String?
+  scenes         String       @default("[]")
   createdById    String
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
   createdBy User              @relation(fields: [createdById], references: [id])
+  department Department?      @relation(fields: [departmentId], references: [id], onDelete: SetNull)
   aliasesRel ProductAlias[]
   items     MechanismItem[]
 }
@@ -146,6 +152,7 @@ model GenerationTask {
   prompt          String?
   status          String     @default("queued")
   failureReason   String?
+  knowledgeEnhanced Boolean  @default(false)
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
 
@@ -186,4 +193,56 @@ model ApiConfig {
   retryCount     Int      @default(2)
   timeoutSeconds Int      @default(240)
   updatedAt      DateTime @updatedAt
+}
+
+model Department {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  code        String?  @unique
+  description String?
+  status      String   @default("active")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users  User[]
+  scenes BusinessScene[]
+  assets KnowledgeAsset[]
+  skills Skill[]
+}
+
+model BusinessScene {
+  id           String   @id @default(cuid())
+  departmentId String
+  sceneKey     String
+  sceneName    String
+  description  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@unique([departmentId, sceneKey])
+}
+
+model Skill {
+  id            String    @id @default(cuid())
+  name          String    @unique
+  displayName   String
+  description   String
+  parameters    String    @default("{\"type\":\"object\",\"properties\":{},\"required\":[]}")
+  executeMode   String    @default("search_kb")
+  executeConfig String    @default("{}")
+  systemPrompt  String?
+  enabled       Boolean   @default(true)
+  departmentId  String?
+  createdById   String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  createdBy  User?       @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([departmentId])
+  @@index([deletedAt])
 }

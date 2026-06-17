@@ -3,11 +3,14 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { type Key, useEffect, useMemo, useState } from "react";
+import type { ExcelPreview } from "@/lib/excel-preview";
+import { Markdown } from "@/components/Markdown";
 import {
   App,
   Avatar,
   Button,
   Card,
+  Collapse,
   Col,
   ConfigProvider,
   Descriptions,
@@ -26,16 +29,75 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   Upload
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 
-type User = { id: string; username: string; nickname: string; role: string; status: string; permissions?: string[] };
+type User = { id: string; username: string; nickname: string; role: string; status: string; departmentId?: string | null; permissions?: string[] };
 type RoleDefinition = { key: string; name: string; permissions: string[]; system: boolean };
-type ChatMessage = { id: string; role: "user" | "assistant"; content: string; createdAt?: string };
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt?: string;
+  processLog?: ProcessLogEntry[];
+  finalDebug?: ChatDebug;
+  finalAssets?: Array<{ id: string; assetName: string; assetType: string }>;
+  streaming?: boolean;
+};
+type ProcessLogEntry =
+  | { type: "intent"; scenes: Array<{ sceneKey: string; sceneName: string; score: number }>; text: string }
+  | { type: "manual_mode"; count: number; text: string }
+  | { type: "retrieve"; assets: Array<{ id: string; assetName: string; assetType: string; score: number }>; contextChars: number; text: string }
+  | {
+      type: "skill";
+      calls: Array<{ id: string; name: string; arguments: unknown; result: string; ok: boolean; error?: string }>;
+      contextChars: number;
+      text: string;
+    }
+  | { type: "context"; chars: number; preview: string; fullContext: string; text: string }
+  | { type: "usage"; promptTokens?: number; completionTokens?: number; totalTokens?: number; text: string }
+  | { type: "error"; error: string; details?: ChatErrorDetails; text: string }
+  | { type: "done"; text: string };
+type ChatErrorDetails = {
+  message?: string;
+  status?: number;
+  url?: string;
+  type?: string;
+  code?: string;
+  param?: string;
+  requestId?: string;
+  bodySnippet?: string;
+};
+type ChatDebug = {
+  useKnowledgeSwitch: boolean;
+  usedPath: "manual" | "auto" | "none";
+  intentScenes: Array<{ sceneKey: string; sceneName: string; score: number }>;
+  ranked: Array<{ id: string; assetName: string; assetType: string; score: number; scenes: string[] }>;
+  baseAssetCount: number;
+  contextCharCount: number;
+  contextPreview?: string;
+};
 type ChatConversationSummary = { id: string; projectId: string; title: string; createdAt: string; updatedAt: string };
 type ChatProjectSummary = { id: string; name: string; createdAt: string; updatedAt: string; conversations: ChatConversationSummary[] };
+type ChatConversationPrefs = {
+  keyword: string;
+  chatAssetType: string;
+  selectedAssetIds: Key[];
+  useAll: boolean;
+  useKnowledge: boolean;
+  question: string;
+};
+const DEFAULT_CHAT_PREFS: ChatConversationPrefs = {
+  keyword: "",
+  chatAssetType: "all",
+  selectedAssetIds: [],
+  useAll: false,
+  useKnowledge: false,
+  question: ""
+};
 type Project = {
   id: string;
   name: string;
@@ -58,6 +120,26 @@ type Asset = {
   fileUrl?: string;
   aliases?: string;
   tags?: string;
+  departmentId?: string | null;
+  scenes?: string | string[];
+  preview?: ExcelPreview | null;
+};
+type Department = { id: string; name: string; code?: string | null; description?: string | null; status: string };
+type BusinessScene = { id: string; departmentId: string; sceneKey: string; sceneName: string; description?: string | null };
+type SkillRow = {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  parameters: string;
+  executeMode: "search_kb" | "get_detail" | "no_op";
+  executeConfig: string;
+  systemPrompt: string | null;
+  enabled: boolean;
+  departmentId: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
 };
 type MechanismParse = {
   id: string;
@@ -238,8 +320,8 @@ export function Dashboard({ view, projectId }: { view: "chatProjects" | "project
         </div>
         {view === "chatProjects" && <ChatProjectsView />}
         {view === "projects" && <ProjectsView />}
-        {view === "project" && projectId && <ProjectWorkspace projectId={projectId} />}
-        {view === "knowledge" && <KnowledgeView />}
+        {view === "project" && projectId && <ProjectWorkspace projectId={projectId} user={user} />}
+        {view === "knowledge" && <KnowledgeView user={user} />}
         {view === "records" && <RecordsView user={user} />}
         {view === "settings" && <SettingsView user={user} />}
       </section>
@@ -355,6 +437,261 @@ function ProjectsView() {
   );
 }
 
+function ChatProcessLog({ entries }: { entries: ProcessLogEntry[] }) {
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
+  const { message } = App.useApp();
+  if (!entries.length) return null;
+  return (
+    <div className="chat-process-log">
+      {entries.map((entry, index) => {
+        const isContext = entry.type === "context";
+        const isSkill = entry.type === "skill";
+        const isOpen = (isContext || isSkill) && openIndex === index;
+        return (
+          <div key={index} className={`chat-process-log-row chat-process-log-${entry.type}`}>
+            <span className="chat-process-log-icon">{logIcon(entry.type)}</span>
+            <span className="chat-process-log-text" style={{ flex: 1 }}>
+              {entry.text}
+              {isContext && entry.fullContext && (
+                <span style={{ marginLeft: 8 }}>
+                  <Button
+                    type="link"
+                    size="small"
+                    style={{ padding: 0, height: "auto", fontSize: 12 }}
+                    onClick={() => setOpenIndex(isOpen ? null : index)}
+                  >
+                    {isOpen ? "收起完整 context" : "查看完整 context"}
+                  </Button>
+                </span>
+              )}
+              {entry.type === "skill" && (
+                <span style={{ marginLeft: 8 }}>
+                  <Button
+                    type="link"
+                    size="small"
+                    style={{ padding: 0, height: "auto", fontSize: 12 }}
+                    onClick={() => setOpenIndex(isOpen ? null : index)}
+                  >
+                    {isOpen ? "收起技能详情" : "查看技能详情"}
+                  </Button>
+                </span>
+              )}
+            </span>
+            {isContext && isOpen && (
+              <div className="chat-process-log-context" style={{ width: "100%" }}>
+                <pre className="chat-process-log-context-pre">{entry.fullContext}</pre>
+                <Space size={8} style={{ marginTop: 6 }}>
+                  <Tag color="default">共 {entry.chars} 字</Tag>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      if (typeof navigator !== "undefined" && navigator.clipboard) {
+                        navigator.clipboard
+                          .writeText(entry.fullContext)
+                          .then(() => message.success("已复制完整 context"))
+                          .catch(() => message.error("复制失败"));
+                      }
+                    }}
+                  >
+                    复制
+                  </Button>
+                </Space>
+              </div>
+            )}
+            {entry.type === "skill" && isOpen && (
+              <div className="chat-process-log-skill" style={{ width: "100%" }}>
+                {entry.calls.map((call) => (
+                  <div key={call.id} style={{ marginBottom: 8 }}>
+                    <Space size={6} wrap>
+                      <Tag color={call.ok ? "blue" : "red"}>{call.name}</Tag>
+                      {!call.ok && <Tag color="red">{call.error}</Tag>}
+                    </Space>
+                    <div style={{ fontSize: 12, color: "#475569", marginTop: 4 }}>
+                      参数：{formatSkillArgs(call.arguments)}
+                    </div>
+                    <pre className="chat-process-log-context-pre" style={{ maxHeight: 220 }}>
+                      {call.result || "（无返回内容）"}
+                    </pre>
+                  </div>
+                ))}
+                <Tag color="default">拼接 context：{entry.contextChars} 字</Tag>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatErrorDetails(details?: ChatErrorDetails) {
+  if (!details) return "";
+  const parts: string[] = [];
+  if (typeof details.status === "number" && details.status > 0) {
+    parts.push(`status=${details.status}`);
+  }
+  if (details.code) parts.push(`code=${details.code}`);
+  if (details.type && details.type !== details.code) parts.push(`type=${details.type}`);
+  if (details.requestId) parts.push(`requestId=${details.requestId}`);
+  if (details.url) parts.push(`url=${details.url}`);
+  if (!parts.length) return "";
+  return `\n详情：${parts.join(" · ")}`;
+}
+
+function formatSkillArgs(args: unknown) {
+  if (!args || typeof args !== "object") return String(args ?? "");
+  const entries = Object.entries(args as Record<string, unknown>);
+  if (!entries.length) return "";
+  return entries
+    .map(([key, value]) => {
+      if (value === undefined || value === null) return `${key}=`;
+      if (typeof value === "string") {
+        const trimmed = value.length > 40 ? `${value.slice(0, 40)}…` : value;
+        return `${key}="${trimmed}"`;
+      }
+      return `${key}=${JSON.stringify(value)}`;
+    })
+    .join(", ");
+}
+
+function logIcon(type: ProcessLogEntry["type"]) {
+  switch (type) {
+    case "intent":
+      return "🔍";
+    case "manual_mode":
+      return "📚";
+    case "retrieve":
+      return "✅";
+    case "skill":
+      return "🛠";
+    case "context":
+      return "🧠";
+    case "usage":
+      return "📊";
+    case "error":
+      return "❌";
+    case "done":
+      return "✨";
+    default:
+      return "•";
+  }
+}
+
+function ChatDebugPanel({ debug }: { debug: ChatDebug }) {
+  const [mode, setMode] = useState<"refs" | "debug">("refs");
+  const [collapsed, setCollapsed] = useState(false);
+  const ranked = debug.ranked || [];
+  const hasRefs = ranked.length > 0;
+  const manualRefs = debug.baseAssetCount || 0;
+  const usedKB = debug.usedPath !== "none" && (hasRefs || manualRefs > 0);
+  const intentNames = debug.intentScenes?.map((s) => s.sceneName).filter(Boolean).join("、") || "无";
+  return (
+    <div className={`chat-debug-panel ${usedKB ? "kb-used" : "kb-empty"}`}>
+      <div className="chat-debug-status">
+        {usedKB ? (
+          <Tag color="green" style={{ fontSize: 13, padding: "2px 10px" }}>
+            ✅ 已调用知识库
+            {debug.usedPath === "auto" && hasRefs ? ` · 命中 ${ranked.length} 条` : ""}
+            {debug.usedPath === "manual" ? ` · 手动路径 ${manualRefs} 条` : ""}
+            {debug.usedPath === "auto" && !hasRefs ? " · 本部门无匹配资料" : ""}
+          </Tag>
+        ) : (
+          <Tag color="default" style={{ fontSize: 13, padding: "2px 10px" }}>
+            ❌ 未调用知识库
+            {debug.useKnowledgeSwitch ? "（已开启开关但本部门无匹配资料）" : "（未打开「使用知识库」开关）"}
+          </Tag>
+        )}
+        {usedKB ? (
+          <Button size="small" type="link" onClick={() => setCollapsed((value) => !value)}>
+            {collapsed ? `展开引用（${hasRefs || manualRefs}）` : "收起"}
+          </Button>
+        ) : null}
+      </div>
+      {usedKB && !collapsed ? (
+        <>
+          <div className="chat-debug-tabs">
+            <Button
+              size="small"
+              type={mode === "refs" ? "primary" : "default"}
+              onClick={() => setMode("refs")}
+            >
+              📎 引用 {hasRefs || manualRefs} 条资料
+            </Button>
+            <Button
+              size="small"
+              type={mode === "debug" ? "primary" : "default"}
+              onClick={() => setMode("debug")}
+            >
+              🔍 调用详情
+            </Button>
+          </div>
+          {mode === "refs" ? (
+            <div className="chat-debug-refs">
+              {hasRefs ? (
+                <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    路径：{debug.usedPath === "auto" ? "部门 KB 检索" : "手动选用"}
+                    {debug.intentScenes?.length ? ` · 场景：${intentNames}` : ""}
+                  </Typography.Text>
+                  {ranked.map((entry, index) => (
+                    <div key={entry.id} className="chat-debug-ref-item">
+                      <Tag color="cyan">资料{index + 1}</Tag>
+                      <Typography.Text strong>{entry.assetName}</Typography.Text>
+                      <Tag>{assetTypeLabel(entry.assetType)}</Tag>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>score {entry.score}</Typography.Text>
+                      {entry.scenes.length ? (
+                        <Space size={4}>
+                          {entry.scenes.map((scene) => (
+                            <Tag key={scene} color="blue">{scene}</Tag>
+                          ))}
+                        </Space>
+                      ) : null}
+                    </div>
+                  ))}
+                </Space>
+              ) : (
+                <Typography.Text type="secondary">手动路径拉取了 {manualRefs} 条资料。</Typography.Text>
+              )}
+            </div>
+          ) : (
+            <div className="chat-debug-detail">
+              <Descriptions size="small" column={2} style={{ marginTop: 8 }}>
+                <Descriptions.Item label="KB 开关">{debug.useKnowledgeSwitch ? "开" : "关"}</Descriptions.Item>
+                <Descriptions.Item label="调用路径">
+                  {debug.usedPath === "auto" ? "部门 KB 检索" : debug.usedPath === "manual" ? "手动选用" : "未调用"}
+                </Descriptions.Item>
+                <Descriptions.Item label="命中场景" span={2}>{intentNames}</Descriptions.Item>
+                <Descriptions.Item label="命中条数">{hasRefs || manualRefs}</Descriptions.Item>
+                <Descriptions.Item label="Context 字符">{debug.contextCharCount}</Descriptions.Item>
+              </Descriptions>
+              {hasRefs ? (
+                <div className="chat-debug-ranked">
+                  <Typography.Text strong style={{ fontSize: 12 }}>命中列表：</Typography.Text>
+                  {ranked.map((entry) => (
+                    <div key={entry.id} className="chat-debug-ranked-row">
+                      <Tag color="purple">score {entry.score}</Tag>
+                      <span>{entry.assetName}</span>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        {entry.scenes.length ? `场景：${entry.scenes.join("、")}` : "通用"}
+                      </Typography.Text>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {debug.contextPreview ? (
+                <div className="chat-debug-context">
+                  <Typography.Text strong style={{ fontSize: 12 }}>Context 预览（前 1500 字）：</Typography.Text>
+                  <pre>{debug.contextPreview}</pre>
+                </div>
+              ) : null}
+            </div>
+          )}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 function ChatProjectsView() {
   const [chatProjects, setChatProjects] = useState<ChatProjectSummary[]>([]);
   const [activeChatProjectId, setActiveChatProjectId] = useState<string>();
@@ -365,16 +702,23 @@ function ChatProjectsView() {
   const [chatProjectForm] = Form.useForm();
   const [renameForm] = Form.useForm();
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [keyword, setKeyword] = useState("");
-  const [chatAssetType, setChatAssetType] = useState("all");
-  const [selectedAssetIds, setSelectedAssetIds] = useState<Key[]>([]);
-  const [useAll, setUseAll] = useState(false);
+  const [chatPrefs, setChatPrefs] = useState<Record<string, ChatConversationPrefs>>({});
   const [assetDrawerOpen, setAssetDrawerOpen] = useState(false);
-  const [question, setQuestion] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [chatUploadLoading, setChatUploadLoading] = useState(false);
   const { message, modal } = App.useApp();
+
+  const activePrefs: ChatConversationPrefs = activeConversationId
+    ? chatPrefs[activeConversationId] || DEFAULT_CHAT_PREFS
+    : DEFAULT_CHAT_PREFS;
+  function patchActivePrefs(patch: Partial<ChatConversationPrefs>) {
+    if (!activeConversationId) return;
+    setChatPrefs((current) => ({
+      ...current,
+      [activeConversationId]: { ...(current[activeConversationId] || DEFAULT_CHAT_PREFS), ...patch }
+    }));
+  }
 
   async function loadChatProjects(preferredConversationId = activeConversationId) {
     const payload = await api<{ projects: ChatProjectSummary[] }>("/api/chat-projects");
@@ -397,7 +741,7 @@ function ChatProjectsView() {
     setChatMessages(payload.messages.map((item) => ({ id: item.id, role: item.role, content: item.content })));
   }
 
-  async function loadAssets(nextKeyword = keyword, nextAssetType = chatAssetType) {
+  async function loadAssets(nextKeyword = activePrefs.keyword, nextAssetType = activePrefs.chatAssetType) {
     const params = new URLSearchParams();
     if (nextKeyword.trim()) params.set("q", nextKeyword.trim());
     if (nextAssetType !== "all") params.set("assetType", nextAssetType);
@@ -411,7 +755,7 @@ function ChatProjectsView() {
   }, []);
 
   async function sendChat() {
-    const currentQuestion = question.trim();
+    const currentQuestion = activePrefs.question.trim();
     if (!currentQuestion) {
       message.warning("请先输入对话内容");
       return;
@@ -420,24 +764,143 @@ function ChatProjectsView() {
       message.warning("请先新建或选择一个对话");
       return;
     }
-    setQuestion("");
-    setChatMessages((current) => [...current, { id: `user-${Date.now()}`, role: "user", content: currentQuestion }]);
+    patchActivePrefs({ question: "" });
+    const userMsgId = `user-${Date.now()}`;
+    const assistantId = `assistant-${Date.now()}`;
+    setChatMessages((current) => [
+      ...current,
+      { id: userMsgId, role: "user", content: currentQuestion },
+      { id: assistantId, role: "assistant", content: "", processLog: [], streaming: true }
+    ]);
     setLoading(true);
+    let aborted = false;
     try {
-      const payload = await api<{ answer: string }>("/api/chat", {
+      const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: currentQuestion, useAll, assetIds: selectedAssetIds, assetType: chatAssetType, conversationId: activeConversationId })
+        body: JSON.stringify({
+          message: currentQuestion,
+          useAll: activePrefs.useAll,
+          useKnowledge: activePrefs.useKnowledge,
+          assetIds: activePrefs.selectedAssetIds,
+          assetType: activePrefs.chatAssetType,
+          conversationId: activeConversationId
+        })
       });
-      setChatMessages((current) => [...current, { id: `assistant-${Date.now()}`, role: "assistant", content: payload.answer }]);
-      loadChatProjects(activeConversationId).catch((error) => message.error(error.message));
+      if (!response.ok || !response.body) {
+        const errText = await response.text();
+        throw new Error(errText || `HTTP ${response.status}`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalAnswer = "";
+      let finalDebug: ChatDebug | undefined;
+      let finalAssets: Array<{ id: string; assetName: string; assetType: string }> = [];
+      const updateMessage = (updater: (msg: ChatMessage) => ChatMessage) => {
+        setChatMessages((current) => current.map((msg) => (msg.id === assistantId ? updater(msg) : msg)));
+      };
+      const appendLog = (entry: ProcessLogEntry) => {
+        updateMessage((msg) => ({ ...msg, processLog: [...(msg.processLog || []), entry] }));
+      };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || "";
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data) continue;
+          let event: any;
+          try {
+            event = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          if (event.type === "manual_mode") {
+            appendLog({ type: "manual_mode", count: event.count, text: `📚 手动选用 ${event.count} 条资料，跳过自动检索` });
+          } else if (event.type === "intent") {
+            if (event.scenes?.length) {
+              const scenes = event.scenes as Array<{ sceneKey: string; sceneName: string; score: number }>;
+              const top = scenes.slice(0, 3).map((s) => s.sceneName).join("、");
+              appendLog({ type: "intent", scenes, text: `🔍 识别问题场景：${top}` });
+            } else {
+              appendLog({ type: "intent", scenes: [], text: "🔍 未识别到具体场景，将按本部门全部启用资料检索" });
+            }
+          } else if (event.type === "retrieve") {
+            const names = event.assets?.map((a: any) => a.assetName).slice(0, 3).join("、") || "（无）";
+            appendLog({
+              type: "retrieve",
+              assets: event.assets || [],
+              contextChars: event.contextChars || 0,
+              text: `✅ 命中 ${event.assets?.length || 0} 条资料：${names}${event.assets?.length > 3 ? "…" : ""}`
+            });
+          } else if (event.type === "skill") {
+            const calls = (event.calls || []) as Array<{ id: string; name: string; arguments: unknown; result: string; ok: boolean; error?: string }>;
+            const summary = calls
+              .map((call) => {
+                const argsText = formatSkillArgs(call.arguments);
+                return `${call.name}(${argsText})`;
+              })
+              .join("；");
+            const okCount = calls.filter((c) => c.ok).length;
+            const text = `🛠 调用 ${calls.length} 个技能：${summary || "（无）"}${okCount < calls.length ? `（失败 ${calls.length - okCount}）` : ""}`;
+            appendLog({ type: "skill", calls, contextChars: event.contextChars || 0, text });
+          } else if (event.type === "context") {
+            appendLog({ type: "context", chars: event.chars, preview: event.preview, fullContext: event.fullContext, text: `🧠 已拼接 context（${event.chars} 字）` });
+          } else if (event.type === "text") {
+            finalAnswer += event.text;
+            updateMessage((msg) => ({ ...msg, content: msg.content + event.text }));
+          } else if (event.type === "usage") {
+            const tokens = event.totalTokens || (event.promptTokens || 0) + (event.completionTokens || 0);
+            appendLog({ type: "usage", ...event, text: `📊 Token：${tokens}（输入 ${event.promptTokens || 0} / 输出 ${event.completionTokens || 0}）` });
+          } else if (event.type === "error") {
+            aborted = true;
+            const details: ChatErrorDetails | undefined = event.details && typeof event.details === "object" ? event.details : undefined;
+            appendLog({
+              type: "error",
+              error: event.error,
+              details,
+              text: `❌ ${event.error}${formatErrorDetails(details)}`
+            });
+            updateMessage((msg) => ({ ...msg, content: msg.content || "（对话失败）" }));
+          } else if (event.type === "done") {
+            finalAnswer = event.answer || finalAnswer;
+            finalDebug = event.debug;
+            finalAssets = event.usedAssets || [];
+            appendLog({ type: "done", text: `✨ 对话完成` });
+          }
+        }
+      }
+      updateMessage((msg) => ({
+        ...msg,
+        content: finalAnswer || msg.content,
+        streaming: false,
+        finalDebug,
+        finalAssets
+      }));
+      if (!aborted) {
+        loadChatProjects(activeConversationId).catch((error) => message.error(error.message));
+      }
     } catch (error) {
       const errorMessage = (error as Error).message;
-      setChatMessages((current) => [...current, { id: `assistant-error-${Date.now()}`, role: "assistant", content: `对话失败：${errorMessage}` }]);
+      updateMessageSafe(assistantId, (msg) => ({
+        ...msg,
+        content: msg.content || `对话失败：${errorMessage}`,
+        streaming: false,
+        processLog: [...(msg.processLog || []), { type: "error", error: errorMessage, text: `❌ ${errorMessage}` }]
+      }));
       message.error(errorMessage);
     } finally {
       setLoading(false);
     }
+  }
+
+  function updateMessageSafe(id: string, updater: (msg: ChatMessage) => ChatMessage) {
+    setChatMessages((current) => current.map((msg) => (msg.id === id ? updater(msg) : msg)));
   }
 
   async function uploadChatMaterials(options: any) {
@@ -450,7 +913,7 @@ function ChatProjectsView() {
     setChatUploadLoading(true);
     try {
       const formData = new FormData();
-      formData.append("assetType", "document");
+      formData.append("assetType", "");
       for (const file of realFiles) {
         formData.append("files", file);
       }
@@ -458,10 +921,16 @@ function ChatProjectsView() {
         method: "POST",
         body: formData
       });
-      setChatAssetType("all");
-      setUseAll(false);
+      patchActivePrefs({ chatAssetType: "all", useAll: false });
       setAssets((current) => mergeAssets(payload.assets, current));
-      setSelectedAssetIds((current) => Array.from(new Set([...current.map(String), ...payload.assets.map((asset) => asset.id)])));
+      patchActivePrefs({
+        selectedAssetIds: Array.from(
+          new Set([
+            ...(activePrefs.selectedAssetIds || []).map(String),
+            ...payload.assets.map((asset) => asset.id)
+          ])
+        )
+      });
       options.onSuccess?.(payload);
       message.success(`已上传并选中 ${payload.assets.length} 份资料`);
     } catch (error) {
@@ -658,7 +1127,23 @@ function ChatProjectsView() {
                 <div className={`chat-row ${item.role}`} key={item.id}>
                   {item.role === "assistant" && <Avatar className="chat-avatar">AI</Avatar>}
                   <div className="chat-bubble">
-                    <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>{item.content}</Typography.Paragraph>
+                    {item.role === "assistant" && (item.processLog?.length || 0) > 0 ? (
+                      <ChatProcessLog entries={item.processLog || []} />
+                    ) : null}
+                    {item.role === "assistant" ? (
+                      item.content ? (
+                        <Markdown content={item.content} />
+                      ) : item.streaming ? (
+                        <Typography.Text type="secondary">▍</Typography.Text>
+                      ) : null
+                    ) : (
+                      <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
+                        {item.content || (item.streaming ? " " : "")}
+                      </Typography.Paragraph>
+                    )}
+                    {item.role === "assistant" && !item.streaming && item.finalDebug ? (
+                      <ChatDebugPanel debug={item.finalDebug} />
+                    ) : null}
                   </div>
                   {item.role === "user" && <Avatar className="chat-avatar user-avatar">我</Avatar>}
                 </div>
@@ -669,11 +1154,11 @@ function ChatProjectsView() {
                 <Typography.Text type="secondary">直接输入问题即可；需要参考资料时，再选择知识库资料或在问题里说明调用知识库。</Typography.Text>
               </div>
             )}
-            {loading && (
+            {loading && !chatMessages.some((item) => item.streaming) && (
               <div className="chat-row assistant">
                 <Avatar className="chat-avatar">AI</Avatar>
                 <div className="chat-bubble">
-                  <Typography.Text type="secondary">{useAll || selectedAssetIds.length ? "正在查找知识库并组织回答..." : "正在组织回答..."}</Typography.Text>
+                  <Typography.Text type="secondary">{activePrefs.useKnowledge ? "正在按部门场景检索知识库..." : "正在组织回答..."}</Typography.Text>
                 </div>
               </div>
             )}
@@ -681,9 +1166,9 @@ function ChatProjectsView() {
           <div className="chat-composer">
             <Input.TextArea
               autoSize={{ minRows: 2, maxRows: 6 }}
-              value={question}
+              value={activePrefs.question}
               disabled={!activeConversationId}
-              onChange={(event) => setQuestion(event.target.value)}
+              onChange={(event) => patchActivePrefs({ question: event.target.value })}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -699,15 +1184,23 @@ function ChatProjectsView() {
                   multiple
                   showUploadList={false}
                   customRequest={uploadChatMaterials}
-                  accept=".txt,.md,.csv,.json,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,image/png,image/jpeg,image/webp"
+                  accept=".txt,.md,.csv,.json,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff,image/heic,image/heif,image/avif,image/x-icon,image/svg+xml,image/vnd.adobe.photoshop"
                 >
                   <Button loading={chatUploadLoading}>上传资料</Button>
                 </Upload>
+                <Tooltip title="开启后，对话会按本部门 + 业务场景智能检索知识库并增强上下文">
+                  <Switch
+                    checked={activePrefs.useKnowledge}
+                    onChange={(value) => patchActivePrefs({ useKnowledge: value })}
+                    checkedChildren="使用知识库"
+                    unCheckedChildren="不使用知识库"
+                  />
+                </Tooltip>
                 <Typography.Text type="secondary">
-                  {useAll
-                    ? `调用${chatAssetType === "all" ? "全部" : assetTypeLabel(chatAssetType)}资料`
-                    : selectedAssetIds.length
-                      ? `已选择 ${selectedAssetIds.length} 条资料`
+                  {activePrefs.useAll
+                    ? `调用${activePrefs.chatAssetType === "all" ? "全部" : assetTypeLabel(activePrefs.chatAssetType)}资料`
+                    : activePrefs.selectedAssetIds.length
+                      ? `已选择 ${activePrefs.selectedAssetIds.length} 条资料`
                       : "未调用知识库"}
                 </Typography.Text>
               </Space>
@@ -745,20 +1238,19 @@ function ChatProjectsView() {
         <Space direction="vertical" size={14} style={{ width: "100%" }}>
           <Input.Search
             placeholder="搜索知识库资料、提示词或文档"
-            value={keyword}
-            onChange={(event) => setKeyword(event.target.value)}
+            value={activePrefs.keyword}
+            onChange={(event) => patchActivePrefs({ keyword: event.target.value })}
             onSearch={(value) => loadAssets(value).catch((error) => message.error(error.message))}
             enterButton="搜索"
           />
           <Space wrap>
             <span>资料分类</span>
             <Select
-              value={chatAssetType}
+              value={activePrefs.chatAssetType}
               style={{ width: 180 }}
               onChange={(value) => {
-                setChatAssetType(value);
-                setSelectedAssetIds([]);
-                loadAssets(keyword, value).catch((error) => message.error(error.message));
+                patchActivePrefs({ chatAssetType: value, selectedAssetIds: [] });
+                loadAssets(activePrefs.keyword, value).catch((error) => message.error(error.message));
               }}
               options={[
                 { value: "all", label: "全部资料" },
@@ -768,10 +1260,16 @@ function ChatProjectsView() {
                 { value: "prompt", label: "提示词" },
                 { value: "pdf", label: "PDF" },
                 { value: "ppt", label: "PPT" },
+                { value: "excel", label: "Excel 文件" },
                 { value: "document", label: "文档" }
               ]}
             />
-            <Switch checked={useAll} onChange={setUseAll} checkedChildren="调用全部知识库" unCheckedChildren="选择资料调用" />
+            <Switch
+              checked={activePrefs.useAll}
+              onChange={(value) => patchActivePrefs({ useAll: value })}
+              checkedChildren="调用全部知识库"
+              unCheckedChildren="选择资料调用"
+            />
           </Space>
           <Table
             size="small"
@@ -779,11 +1277,11 @@ function ChatProjectsView() {
             dataSource={assets}
             pagination={{ pageSize: 6 }}
             rowSelection={
-              useAll
+              activePrefs.useAll
                 ? undefined
                 : {
-                    selectedRowKeys: selectedAssetIds,
-                    onChange: setSelectedAssetIds
+                    selectedRowKeys: activePrefs.selectedAssetIds,
+                    onChange: (keys) => patchActivePrefs({ selectedAssetIds: keys })
                   }
             }
             columns={[
@@ -792,14 +1290,18 @@ function ChatProjectsView() {
               { title: "说明", render: (_, row) => row.description || row.productName || "-" }
             ]}
           />
-          <Typography.Text type="secondary">{useAll ? "本次对话会调用当前分类下全部启用的知识库资料。" : `已选择 ${selectedAssetIds.length} 条资料。`}</Typography.Text>
+          <Typography.Text type="secondary">
+            {activePrefs.useAll
+              ? "本次对话会调用当前分类下全部启用的知识库资料。"
+              : `已选择 ${activePrefs.selectedAssetIds.length} 条资料。`}
+          </Typography.Text>
         </Space>
       </Drawer>
     </Space>
   );
 }
 
-function ProjectWorkspace({ projectId }: { projectId: string }) {
+function ProjectWorkspace({ projectId, user }: { projectId: string; user: User }) {
   const [project, setProject] = useState<Project | null>(null);
   const [parses, setParses] = useState<MechanismParse[]>([]);
   const [tasks, setTasks] = useState<GenerationTask[]>([]);
@@ -830,19 +1332,24 @@ function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [customLoading, setCustomLoading] = useState(false);
   const [generationPanel, setGenerationPanel] = useState<"standard" | "custom">("standard");
   const [loading, setLoading] = useState(false);
+  const [knowledgeEnhanced, setKnowledgeEnhanced] = useState(false);
+  const [sceneCount, setSceneCount] = useState(0);
   const { message, modal } = App.useApp();
 
   async function load() {
-    const [projectPayload, taskPayload, templatePayload, portraitPayload] = await Promise.all([
+    const [projectPayload, taskPayload, templatePayload, portraitPayload, scenePayload] = await Promise.all([
       api<{ project: Project }>(`/api/projects/${projectId}`),
       api<{ tasks: GenerationTask[] }>(`/api/generation/tasks?projectId=${projectId}`),
       api<{ assets: Asset[] }>("/api/knowledge/assets?assetType=main_template"),
-      api<{ assets: Asset[] }>("/api/knowledge/assets?assetType=portrait_white_image")
+      api<{ assets: Asset[] }>("/api/knowledge/assets?assetType=portrait_white_image"),
+      api<{ scenes: BusinessScene[] }>("/api/settings/scenes")
     ]);
     setProject(projectPayload.project);
     setTasks(taskPayload.tasks);
     setMainTemplates(templatePayload.assets.filter((asset) => asset.enabled));
     setPortraitAssets(portraitPayload.assets.filter((asset) => asset.enabled));
+    const ownDeptId = user.departmentId || "dept_default";
+    setSceneCount(scenePayload.scenes.filter((scene) => scene.departmentId === ownDeptId).length);
   }
 
   useEffect(() => {
@@ -932,7 +1439,8 @@ function ProjectWorkspace({ projectId }: { projectId: string }) {
             detailPromptTemplate,
             fullPromptOverrides: promptOverrides,
             mainTemplateAssetId,
-            portraitAssetId
+            portraitAssetId,
+            knowledgeEnhanced
           }
         })
       });
@@ -1103,6 +1611,23 @@ function ProjectWorkspace({ projectId }: { projectId: string }) {
                 <Radio.Button value="main_image">1:1 主图</Radio.Button>
                 <Radio.Button value="detail_pages">9:16 详情页</Radio.Button>
               </Radio.Group>
+              <Tooltip
+                title={
+                  sceneCount === 0
+                    ? "请先在「设置 → 部门与场景」中为本部门配置业务场景后再开启"
+                    : "开启后，会按本部门 + 业务场景动态检索知识库并增强本次提示词"
+                }
+              >
+                <Space>
+                  <Switch
+                    checked={knowledgeEnhanced}
+                    onChange={setKnowledgeEnhanced}
+                    disabled={sceneCount === 0}
+                    checkedChildren="知识库增强：开"
+                    unCheckedChildren="知识库增强：关"
+                  />
+                </Space>
+              </Tooltip>
               <Input.TextArea rows={8} value={rawText} onChange={(event) => setRawText(event.target.value)} placeholder="请输入价格机制，一行一条" />
               <Space wrap>
                 <span>主图数量</span>
@@ -1652,38 +2177,97 @@ function TaskResults({ tasks, onRefresh }: { tasks: GenerationTask[]; onRefresh:
   );
 }
 
-function KnowledgeView() {
+function KnowledgeView({ user }: { user: User }) {
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [assetType, setAssetType] = useState("product_white_image");
   const [viewAssetType, setViewAssetType] = useState("all");
   const [editing, setEditing] = useState<Asset | null>(null);
   const [form] = Form.useForm();
   const [textForm] = Form.useForm();
-  const { message } = App.useApp();
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [allScenes, setAllScenes] = useState<BusinessScene[]>([]);
+  const [filterDepartmentId, setFilterDepartmentId] = useState<string | "all">("all");
+  const watchedDepartmentId = Form.useWatch("departmentId", form);
+  const [excelPreview, setExcelPreview] = useState<Asset | null>(null);
+  const { message, modal } = App.useApp();
+  const isAdmin = user.role === "admin";
 
-  async function load(nextType = viewAssetType) {
-    const suffix = nextType === "all" ? "" : `?assetType=${encodeURIComponent(nextType)}`;
+  function canDeleteAsset(asset: Asset) {
+    if (isAdmin) return true;
+    if (!user.departmentId) return false;
+    return asset.departmentId === user.departmentId;
+  }
+
+  function confirmDeleteAsset(asset: Asset) {
+    modal.confirm({
+      title: "删除知识库资料",
+      content: `确定删除“${asset.assetName}”吗？该操作不可恢复，相关产品别名和历史引用都会一并清理。`,
+      okText: "删除",
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await api(`/api/knowledge/assets/${asset.id}`, { method: "DELETE" });
+          message.success("资料已删除");
+          if (editing?.id === asset.id) setEditing(null);
+          await load();
+        } catch (error) {
+          message.error((error as Error).message);
+        }
+      }
+    });
+  }
+
+  async function load(nextType = viewAssetType, nextDept = filterDepartmentId) {
+    const params = new URLSearchParams();
+    if (nextType !== "all") params.set("assetType", nextType);
+    if (isAdmin && nextDept !== "all") params.set("departmentId", nextDept);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
     const payload = await api<{ assets: Asset[] }>(`/api/knowledge/assets${suffix}`);
     setAssets(payload.assets);
   }
 
+  async function loadMeta() {
+    try {
+      const [deptPayload, scenePayload] = await Promise.all([
+        api<{ departments: Department[] }>("/api/settings/departments"),
+        api<{ scenes: BusinessScene[] }>("/api/settings/scenes")
+      ]);
+      setDepartments(deptPayload.departments);
+      setAllScenes(scenePayload.scenes);
+    } catch (error) {
+      message.error((error as Error).message);
+    }
+  }
+
   useEffect(() => {
     load().catch((error) => message.error(error.message));
-  }, [viewAssetType]);
+    loadMeta();
+  }, []);
 
-  async function save(values: Asset) {
+  async function save(values: Record<string, unknown>) {
     if (!editing) return;
+    const payload = {
+      ...values,
+      aliases: (values.aliases ? String(values.aliases) : "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+      tags: (values.tags ? String(values.tags) : "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+      scenes: Array.isArray(values.scenes) ? values.scenes : []
+    };
     await api(`/api/knowledge/assets/${editing.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(values)
+      body: JSON.stringify(payload)
     });
     message.success("资料已保存");
     setEditing(null);
     load();
   }
 
-  async function saveTextAsset(values: { assetType: string; assetName: string; description?: string; text: string }) {
+  async function saveTextAsset(values: { assetType: string; assetName: string; description?: string; text: string; departmentId?: string; scenes?: string[] }) {
     await api("/api/knowledge/text", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1694,10 +2278,34 @@ function KnowledgeView() {
     load();
   }
 
+  const effectiveDeptId = user.departmentId || "dept_default";
+  const departmentOptions = useMemo(
+    () => [
+      { value: "all", label: "全部部门" },
+      ...departments.map((dept) => ({ value: dept.id, label: dept.name }))
+    ],
+    [departments]
+  );
+  const sceneOptionsForDept = useMemo(() => {
+    const deptId = watchedDepartmentId || effectiveDeptId;
+    return allScenes
+      .filter((scene) => scene.departmentId === deptId)
+      .map((scene) => ({ value: scene.sceneKey, label: `${scene.sceneName}（${scene.sceneKey}）` }));
+  }, [allScenes, watchedDepartmentId, effectiveDeptId]);
+  const departmentFormOptions = useMemo(
+    () => departments.map((dept) => ({ value: dept.id, label: dept.name })),
+    [departments]
+  );
+
   return (
     <Space direction="vertical" size={18} style={{ width: "100%" }}>
       <Card className="soft-card" title="提示词 / 文档">
-        <Form form={textForm} layout="vertical" onFinish={saveTextAsset} initialValues={{ assetType: "prompt" }}>
+        <Form
+          form={textForm}
+          layout="vertical"
+          onFinish={saveTextAsset}
+          initialValues={{ assetType: "prompt", departmentId: isAdmin ? undefined : effectiveDeptId }}
+        >
           <Row gutter={16}>
             <Col xs={24} md={6}>
               <Form.Item name="assetType" label="类型">
@@ -1730,31 +2338,25 @@ function KnowledgeView() {
       </Card>
       <Card className="soft-card" title="上传知识库资料">
         <Space wrap>
-          <Select
-            value={assetType}
-            onChange={setAssetType}
-            options={[
-              { value: "product_white_image", label: "产品白底图" },
-              { value: "main_template", label: "主图模板" },
-              { value: "portrait_white_image", label: "达人肖像白底图" },
-              { value: "prompt", label: "提示词" },
-              { value: "pdf", label: "PDF" },
-              { value: "ppt", label: "PPT" },
-              { value: "document", label: "文档" }
-            ]}
-          />
+          <Typography.Text type="secondary">
+            支持图片（产品白底图 / 主图模板 / 达人肖像）、PDF、PPT、Excel、文档等混合批量上传，类型按文件扩展名自动识别。
+          </Typography.Text>
           <Upload
             multiple
             showUploadList={false}
             customRequest={async ({ file, onSuccess, onError }) => {
               try {
                 const formData = new FormData();
-                formData.append("assetType", assetType);
                 formData.append("files", file as File);
-                await api("/api/knowledge/upload", { method: "POST", body: formData });
+                if (isAdmin && user.departmentId) {
+                  formData.append("departmentId", user.departmentId);
+                }
+                const payload = await api<{ assets: Asset[] }>("/api/knowledge/upload", { method: "POST", body: formData });
                 onSuccess?.("ok");
                 message.success("上传成功");
-                load();
+                const excelAsset = payload.assets.find((asset) => asset.assetType === "excel" && asset.preview);
+                if (excelAsset) setExcelPreview(excelAsset);
+                await load();
               } catch (error) {
                 onError?.(error as Error);
                 message.error((error as Error).message);
@@ -1772,6 +2374,7 @@ function KnowledgeView() {
           <span>查看类型</span>
           <Select
             value={viewAssetType}
+            style={{ minWidth: 160 }}
             onChange={(value) => {
               setViewAssetType(value);
               load(value).catch((error) => message.error(error.message));
@@ -1784,9 +2387,24 @@ function KnowledgeView() {
               { value: "prompt", label: "提示词" },
               { value: "pdf", label: "PDF" },
               { value: "ppt", label: "PPT" },
+              { value: "excel", label: "Excel 文件" },
               { value: "document", label: "文档" }
             ]}
           />
+          {isAdmin && (
+            <>
+              <span>部门</span>
+              <Select
+                value={filterDepartmentId}
+                style={{ minWidth: 180 }}
+                onChange={(value) => {
+                  setFilterDepartmentId(value);
+                  load(viewAssetType, value).catch((error) => message.error(error.message));
+                }}
+                options={departmentOptions}
+              />
+            </>
+          )}
         </Space>
         <Table
           rowKey="id"
@@ -1805,20 +2423,68 @@ function KnowledgeView() {
             { title: "资料名称", dataIndex: "assetName" },
             { title: "产品名称", dataIndex: "productName" },
             { title: "类型", render: (_, row) => assetTypeLabel(row.assetType) },
+            {
+              title: "部门",
+              render: (_, row) => {
+                const dept = departments.find((item) => item.id === row.departmentId);
+                return dept ? <Tag color="blue">{dept.name}</Tag> : <Tag>未分配</Tag>;
+              }
+            },
+            {
+              title: "场景",
+              render: (_, row) => {
+                const keys = Array.isArray(row.scenes) ? row.scenes : parseSceneKeys(row.scenes);
+                if (!keys.length) return <Tag color="default">通用</Tag>;
+                return (
+                  <Space size={4} wrap>
+                    {keys.map((key) => (
+                      <Tag key={key} color="cyan">
+                        {sceneLabel(allScenes, row.departmentId, key)}
+                      </Tag>
+                    ))}
+                  </Space>
+                );
+              }
+            },
             { title: "向量化", render: (_, row) => <Tag>{row.vectorStatus}</Tag> },
             { title: "启用", render: (_, row) => <Tag color={row.enabled ? "green" : "red"}>{row.enabled ? "启用" : "停用"}</Tag> },
             {
               title: "操作",
-              render: (_, row) => (
-                <Button
-                  onClick={() => {
-                    setEditing(row);
-                    form.setFieldsValue({ ...row, aliases: jsonList(row.aliases).join("\n"), tags: jsonList(row.tags).join("\n") });
-                  }}
-                >
-                  编辑
-                </Button>
-              )
+              render: (_, row) => {
+                const deletable = canDeleteAsset(row);
+                return (
+                  <Space size={4}>
+                    {row.assetType === "excel" && (
+                      <Button size="small" onClick={() => setExcelPreview(row)}>
+                        查看预览
+                      </Button>
+                    )}
+                    <Button
+                      size="small"
+                      onClick={() => {
+                        setEditing(row);
+                        form.setFieldsValue({
+                          ...row,
+                          aliases: jsonList(row.aliases).join("\n"),
+                          tags: jsonList(row.tags).join("\n"),
+                          scenes: Array.isArray(row.scenes) ? row.scenes : parseSceneKeys(row.scenes)
+                        });
+                      }}
+                    >
+                      编辑
+                    </Button>
+                    <Button
+                      size="small"
+                      danger
+                      disabled={!deletable}
+                      title={deletable ? "删除本部门资料" : "仅本部门管理员可删除"}
+                      onClick={() => confirmDeleteAsset(row)}
+                    >
+                      删除
+                    </Button>
+                  </Space>
+                );
+              }
             }
           ]}
         />
@@ -1840,8 +2506,20 @@ function KnowledgeView() {
                 { value: "prompt", label: "提示词" },
                 { value: "pdf", label: "PDF" },
                 { value: "ppt", label: "PPT" },
+                { value: "excel", label: "Excel 文件" },
                 { value: "document", label: "文档" }
               ]}
+            />
+          </Form.Item>
+          <Form.Item name="departmentId" label="部门" rules={[{ required: true, message: "请选择部门" }]}>
+            <Select options={departmentFormOptions} disabled={!isAdmin} placeholder="选择部门" />
+          </Form.Item>
+          <Form.Item name="scenes" label="业务场景">
+            <Select
+              mode="multiple"
+              allowClear
+              placeholder="按使用场景打标，便于精准检索"
+              options={sceneOptionsForDept}
             />
           </Form.Item>
           <Form.Item name="aliases" label="产品别名">
@@ -1864,7 +2542,110 @@ function KnowledgeView() {
           </Button>
         </Form>
       </Drawer>
+      <ExcelPreviewModal asset={excelPreview} onClose={() => setExcelPreview(null)} />
     </Space>
+  );
+}
+
+function ExcelPreviewModal({ asset, onClose }: { asset: Asset | null; onClose: () => void }) {
+  const preview = asset?.preview;
+  const open = !!asset;
+
+  return (
+    <Modal
+      title={asset ? `Excel 解析预览：${asset.assetName}` : "Excel 解析预览"}
+      open={open}
+      onCancel={onClose}
+      width={920}
+      footer={null}
+      destroyOnClose
+    >
+      {!preview ? (
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+          暂未解析到可用的工作表数据。可能是空文件、扫描件，或解析过程中出现异常。
+        </Typography.Paragraph>
+      ) : (
+        <>
+          <Space size={16} wrap style={{ marginBottom: 12 }}>
+            <Tag color="blue">工作表 {preview.totalSheets}</Tag>
+            <Tag color="cyan">总行数 {preview.totalRows}</Tag>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              每个工作表最多展示前 20 行；如需查看完整数据请使用 Excel 客户端打开源文件。
+            </Typography.Text>
+          </Space>
+          <Tabs
+            items={preview.sheets.map((sheet) => ({
+              key: sheet.name,
+              label: (
+                <Space size={6}>
+                  <span>{sheet.name}</span>
+                  <Tag color="default" style={{ marginInlineEnd: 0 }}>
+                    {sheet.totalRows} 行
+                  </Tag>
+                </Space>
+              ),
+              children: <SheetPreviewTable sheet={sheet} />
+            }))}
+          />
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function SheetPreviewTable({ sheet }: { sheet: NonNullable<NonNullable<Asset["preview"]>["sheets"][number]> }) {
+  const dataSource = useMemo(() => {
+    return sheet.previewRows.map((row, rowIndex) => {
+      const record: Record<string, string> & { __key: string } = { __key: `row-${rowIndex}` };
+      row.forEach((cell, cellIndex) => {
+        record[cellIndex.toString()] = cell;
+      });
+      return record;
+    });
+  }, [sheet.previewRows]);
+
+  const columns = useMemo(() => {
+    const maxCols = sheet.previewRows.reduce((max, row) => Math.max(max, row.length), 0);
+    const cols: ColumnsType<Record<string, string>> = [];
+    for (let i = 0; i < maxCols; i += 1) {
+      cols.push({
+        title: `第 ${i + 1} 列`,
+        dataIndex: i.toString(),
+        key: `col-${i}`,
+        width: 160,
+        render: (value: unknown) => {
+          const text = typeof value === "string" ? value : "";
+          if (text === "") return <Typography.Text type="secondary">-</Typography.Text>;
+          return (
+            <Typography.Paragraph
+              style={{ marginBottom: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+              ellipsis={{ rows: 3, expandable: true, symbol: "展开" }}
+            >
+              {text}
+            </Typography.Paragraph>
+          );
+        }
+      });
+    }
+    return cols;
+  }, [sheet.previewRows]);
+
+  return (
+    <>
+      {sheet.truncated && (
+        <Typography.Paragraph type="warning" style={{ marginBottom: 8 }}>
+          当前工作表行数较多，已截断展示前 20 行。
+        </Typography.Paragraph>
+      )}
+      <Table
+        size="small"
+        rowKey="__key"
+        dataSource={dataSource}
+        columns={columns}
+        pagination={false}
+        scroll={{ x: "max-content", y: 360 }}
+      />
+    </>
   );
 }
 
@@ -2089,6 +2870,7 @@ function SettingsView({ user }: { user: User }) {
   const [users, setUsers] = useState<User[]>([]);
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [roles, setRoles] = useState<RoleDefinition[]>([]);
+  const [departments, setDepartments] = useState<Department[]>([]);
   const [usageRows, setUsageRows] = useState<UsageRow[]>([]);
   const [usageUserId, setUsageUserId] = useState("all");
   const [usagePeriod, setUsagePeriod] = useState("day");
@@ -2102,9 +2884,11 @@ function SettingsView({ user }: { user: User }) {
       api<{ users: User[] }>("/api/users")
     ]);
     const rolePayload = await api<{ roles: RoleDefinition[] }>("/api/settings/roles");
+    const deptPayload = await api<{ departments: Department[] }>("/api/settings/departments");
     configForm.setFieldsValue(config.config);
     setUsers(list.users);
     setRoles(rolePayload.roles);
+    setDepartments(deptPayload.departments);
     await loadUsage();
   }
 
@@ -2158,7 +2942,7 @@ function SettingsView({ user }: { user: User }) {
     }
   }
 
-  async function createUser(values: { username: string; nickname?: string; password: string; role: string }) {
+  async function createUser(values: { username: string; nickname?: string; password: string; role: string; departmentId?: string }) {
     await api("/api/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2169,7 +2953,7 @@ function SettingsView({ user }: { user: User }) {
     load();
   }
 
-  async function updateUser(values: { nickname?: string; role?: string; status?: string; password?: string }) {
+  async function updateUser(values: { nickname?: string; role?: string; status?: string; password?: string; departmentId?: string | null }) {
     if (!editingUser) return;
     await api(`/api/users/${editingUser.id}`, {
       method: "PATCH",
@@ -2310,6 +3094,16 @@ function SettingsView({ user }: { user: User }) {
           )
         },
         {
+          key: "departments",
+          label: "部门与场景",
+          children: <DepartmentAdminView user={user} />
+        },
+        {
+          key: "skills",
+          label: "技能管理",
+          children: <SkillAdminView user={user} />
+        },
+        {
           key: "users",
           label: "用户列表",
           children: (
@@ -2327,6 +3121,14 @@ function SettingsView({ user }: { user: User }) {
                   </Form.Item>
                   <Form.Item name="role">
                     <Select style={{ width: 150 }} options={roleSelectOptions(roles)} />
+                  </Form.Item>
+                  <Form.Item name="departmentId">
+                    <Select
+                      allowClear
+                      placeholder="部门"
+                      style={{ width: 180 }}
+                      options={departments.map((dept) => ({ value: dept.id, label: dept.name }))}
+                    />
                   </Form.Item>
                   <Button type="primary" htmlType="submit">
                     创建
@@ -2405,6 +3207,13 @@ function SettingsView({ user }: { user: User }) {
                         { title: "账号", dataIndex: "username" },
                         { title: "昵称", dataIndex: "nickname" },
                         { title: "角色", render: (_, row) => roleLabel(row.role, roles) },
+                        {
+                          title: "部门",
+                          render: (_, row) => {
+                            const dept = departments.find((item) => item.id === row.departmentId);
+                            return dept ? <Tag color="blue">{dept.name}</Tag> : <Tag>未分配</Tag>;
+                          }
+                        },
                         { title: "状态", render: (_, row) => <Tag color={row.status === "active" ? "green" : "red"}>{row.status === "active" ? "启用" : "停用"}</Tag> },
                         {
                           title: "操作",
@@ -2415,7 +3224,7 @@ function SettingsView({ user }: { user: User }) {
                                 size="small"
                                 onClick={() => {
                                   setEditingUser(row);
-                                  editUserForm.setFieldsValue({ nickname: row.nickname, role: row.role, status: row.status, password: "" });
+                                  editUserForm.setFieldsValue({ nickname: row.nickname, role: row.role, status: row.status, departmentId: row.departmentId || undefined, password: "" });
                                 }}
                               >
                                 编辑
@@ -2534,6 +3343,13 @@ function SettingsView({ user }: { user: User }) {
         </Form.Item>
         <Form.Item name="password" label="重置密码">
           <Input.Password placeholder="不填写则不修改密码" />
+        </Form.Item>
+        <Form.Item name="departmentId" label="部门">
+          <Select
+            allowClear
+            placeholder="选择部门"
+            options={departments.map((dept) => ({ value: dept.id, label: dept.name }))}
+          />
         </Form.Item>
       </Form>
       </Modal>
@@ -2673,6 +3489,7 @@ function assetTypeLabel(type: string) {
       prompt: "提示词",
       pdf: "PDF",
       ppt: "PPT",
+      excel: "Excel 文件",
       document: "文档"
     }[type] || type
   );
@@ -2685,4 +3502,854 @@ function jsonList(value?: string) {
   } catch {
     return [];
   }
+}
+
+function parseSceneKeys(value?: string | string[] | null) {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function sceneLabel(scenes: BusinessScene[], departmentId: string | null | undefined, key: string) {
+  const match = scenes.find((scene) => scene.departmentId === departmentId && scene.sceneKey === key);
+  return match ? match.sceneName : key;
+}
+
+function DepartmentAdminView({ user }: { user: User }) {
+  const isAdmin = user.role === "admin";
+  const canManage = isAdmin || !!user.permissions?.includes("manage_settings");
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [scenes, setScenes] = useState<BusinessScene[]>([]);
+  const [selectedDepartmentId, setSelectedDepartmentId] = useState<string>("");
+  const [deptForm] = Form.useForm();
+  const [editingDept, setEditingDept] = useState<Department | null>(null);
+  const [sceneForm] = Form.useForm();
+  const [editingScene, setEditingScene] = useState<BusinessScene | null>(null);
+  const { message, modal } = App.useApp();
+
+  async function load() {
+    const [deptPayload, scenePayload] = await Promise.all([
+      api<{ departments: Department[] }>("/api/settings/departments"),
+      api<{ scenes: BusinessScene[] }>("/api/settings/scenes")
+    ]);
+    setDepartments(deptPayload.departments);
+    setScenes(scenePayload.scenes);
+    if (!selectedDepartmentId) {
+      const fallback = isAdmin ? deptPayload.departments[0]?.id : user.departmentId || deptPayload.departments[0]?.id;
+      if (fallback) setSelectedDepartmentId(fallback);
+    }
+  }
+
+  useEffect(() => {
+    load().catch((error) => message.error(error.message));
+  }, []);
+
+  async function saveDepartment(values: { name: string; code?: string; description?: string }) {
+    if (!isAdmin) return;
+    if (editingDept) {
+      await api(`/api/settings/departments/${editingDept.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(values)
+      });
+      message.success("部门已更新");
+    } else {
+      await api("/api/settings/departments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(values)
+      });
+      message.success("部门已创建");
+    }
+    setEditingDept(null);
+    deptForm.resetFields();
+    load();
+  }
+
+  function confirmDeleteDept(dept: Department) {
+    modal.confirm({
+      title: `删除部门「${dept.name}」？`,
+      content: "若该部门下仍有用户或资料，将无法删除。",
+      okType: "danger",
+      onOk: async () => {
+        await api(`/api/settings/departments/${dept.id}`, { method: "DELETE" });
+        message.success("部门已删除");
+        if (selectedDepartmentId === dept.id) setSelectedDepartmentId("");
+        load();
+      }
+    });
+  }
+
+  async function saveScene(values: { sceneKey: string; sceneName: string; description?: string }) {
+    if (!selectedDepartmentId) {
+      message.warning("请先选择部门");
+      return;
+    }
+    if (editingScene) {
+      await api(`/api/settings/scenes/${editingScene.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(values)
+      });
+      message.success("场景已更新");
+    } else {
+      await api("/api/settings/scenes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...values, departmentId: selectedDepartmentId })
+      });
+      message.success("场景已创建");
+    }
+    setEditingScene(null);
+    sceneForm.resetFields();
+    load();
+  }
+
+  function confirmDeleteScene(scene: BusinessScene) {
+    modal.confirm({
+      title: `删除场景「${scene.sceneName}」？`,
+      okType: "danger",
+      onOk: async () => {
+        await api(`/api/settings/scenes/${scene.id}`, { method: "DELETE" });
+        message.success("场景已删除");
+        load();
+      }
+    });
+  }
+
+  if (!canManage) {
+    return <Card className="soft-card">当前账号无权限管理部门与场景。</Card>;
+  }
+
+  const filteredScenes = selectedDepartmentId ? scenes.filter((scene) => scene.departmentId === selectedDepartmentId) : scenes;
+  const departmentOptions = departments.map((dept) => ({ value: dept.id, label: dept.name }));
+
+  return (
+    <Space direction="vertical" size={18} style={{ width: "100%" }}>
+      {isAdmin && (
+        <Card className="soft-card" title="部门列表">
+          <Form
+            form={deptForm}
+            layout="inline"
+            onFinish={saveDepartment}
+            style={{ marginBottom: 16, rowGap: 12 }}
+            initialValues={{ name: "", code: "" }}
+          >
+            <Form.Item name="name" rules={[{ required: true, message: "部门名称必填" }]}>
+              <Input placeholder="部门名称，例如 美妆一组" style={{ width: 200 }} />
+            </Form.Item>
+            <Form.Item name="code">
+              <Input placeholder="部门编码（可选）" style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item name="description">
+              <Input placeholder="说明（可选）" style={{ width: 240 }} />
+            </Form.Item>
+            <Form.Item>
+              <Space>
+                <Button type="primary" htmlType="submit">
+                  {editingDept ? "保存" : "新增部门"}
+                </Button>
+                {editingDept && (
+                  <Button
+                    onClick={() => {
+                      setEditingDept(null);
+                      deptForm.resetFields();
+                    }}
+                  >
+                    取消
+                  </Button>
+                )}
+              </Space>
+            </Form.Item>
+          </Form>
+          <Table
+            rowKey="id"
+            dataSource={departments}
+            pagination={{ pageSize: 6 }}
+            columns={[
+              { title: "部门名称", dataIndex: "name" },
+              { title: "编码", dataIndex: "code" },
+              { title: "说明", dataIndex: "description" },
+              { title: "状态", render: (_, row) => <Tag color={row.status === "active" ? "green" : "red"}>{row.status === "active" ? "启用" : "停用"}</Tag> },
+              {
+                title: "操作",
+                render: (_, row) => (
+                  <Space>
+                    <Button
+                      size="small"
+                      onClick={() => {
+                        setEditingDept(row);
+                        deptForm.setFieldsValue({ name: row.name, code: row.code || "", description: row.description || "" });
+                      }}
+                    >
+                      编辑
+                    </Button>
+                    <Button size="small" danger onClick={() => confirmDeleteDept(row)}>
+                      删除
+                    </Button>
+                  </Space>
+                )
+              }
+            ]}
+          />
+        </Card>
+      )}
+      <Card
+        className="soft-card"
+        title="业务场景"
+        extra={
+          isAdmin ? (
+            <Select
+              value={selectedDepartmentId || undefined}
+              onChange={setSelectedDepartmentId}
+              placeholder="选择部门"
+              style={{ minWidth: 200 }}
+              options={departmentOptions}
+            />
+          ) : (
+            <Tag color="blue">{departments.find((dept) => dept.id === (user.departmentId || selectedDepartmentId))?.name || "本部门"}</Tag>
+          )
+        }
+      >
+        <Form form={sceneForm} layout="inline" onFinish={saveScene} style={{ marginBottom: 16, rowGap: 12 }} initialValues={{ sceneKey: "", sceneName: "" }}>
+          <Form.Item name="sceneKey" rules={[{ required: true, message: "场景标识必填" }]}>
+            <Input placeholder="场景标识，例如 面膜 / mask" style={{ width: 200 }} />
+          </Form.Item>
+          <Form.Item name="sceneName" rules={[{ required: true, message: "场景名称必填" }]}>
+            <Input placeholder="场景名称，例如 面膜主图" style={{ width: 200 }} />
+          </Form.Item>
+          <Form.Item name="description">
+            <Input placeholder="说明（可选）" style={{ width: 240 }} />
+          </Form.Item>
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit" disabled={!selectedDepartmentId}>
+                {editingScene ? "保存" : "新增场景"}
+              </Button>
+              {editingScene && (
+                <Button
+                  onClick={() => {
+                    setEditingScene(null);
+                    sceneForm.resetFields();
+                  }}
+                >
+                  取消
+                </Button>
+              )}
+            </Space>
+          </Form.Item>
+        </Form>
+        <Table
+          rowKey="id"
+          dataSource={filteredScenes}
+          pagination={{ pageSize: 8 }}
+          columns={[
+            { title: "场景标识", dataIndex: "sceneKey" },
+            { title: "场景名称", dataIndex: "sceneName" },
+            { title: "说明", dataIndex: "description" },
+            {
+              title: "操作",
+              render: (_, row) => (
+                <Space>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setEditingScene(row);
+                      sceneForm.setFieldsValue({ sceneKey: row.sceneKey, sceneName: row.sceneName, description: row.description || "" });
+                    }}
+                  >
+                    编辑
+                  </Button>
+                  <Button size="small" danger onClick={() => confirmDeleteScene(row)}>
+                    删除
+                  </Button>
+                </Space>
+              )
+            }
+          ]}
+        />
+      </Card>
+    </Space>
+  );
+}
+
+function SkillAdminView({ user }: { user: User }) {
+  const isAdminUser = user.role === "admin";
+  const canManage = isAdminUser || !!user.permissions?.includes("manage_settings");
+  const [skills, setSkills] = useState<SkillRow[]>([]);
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [editingSkill, setEditingSkill] = useState<SkillRow | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [skillForm] = Form.useForm();
+  const [paramRows, setParamRows] = useState<Array<{ uid: string; name: string; description: string; required: boolean }>>([]);
+  const [testArgs, setTestArgs] = useState("{}");
+  const [testResult, setTestResult] = useState<{ ok: boolean; content: string; error?: string; meta?: Record<string, unknown> } | null>(null);
+  const { message, modal } = App.useApp();
+
+  const executeMode = Form.useWatch("executeMode", skillForm) as string | undefined;
+  const queryParam = Form.useWatch("queryParam", skillForm) as string | undefined;
+  const limitParam = Form.useWatch("limitParam", skillForm) as string | undefined;
+  const assetTypeParam = Form.useWatch("assetTypeParam", skillForm) as string | undefined;
+  const assetIdParam = Form.useWatch("assetIdParam", skillForm) as string | undefined;
+  const templateValue = Form.useWatch("template", skillForm) as string | undefined;
+  const systemPrompt = Form.useWatch("systemPrompt", skillForm) as string | undefined;
+
+  function buildParametersJson(): string {
+    const properties: Record<string, { type: string; description?: string }> = {};
+    const required: string[] = [];
+    for (const row of paramRows) {
+      if (!row.name) continue;
+      properties[row.name] = { type: "string", description: row.description || undefined };
+      if (row.required) required.push(row.name);
+    }
+    return JSON.stringify({ type: "object", properties, required });
+  }
+
+  function buildExecuteConfigJson(): string {
+    if (executeMode === "search_kb") {
+      const cfg: Record<string, string> = {};
+      if (queryParam) cfg.queryParam = queryParam;
+      if (limitParam) cfg.limitParam = limitParam;
+      if (assetTypeParam) cfg.assetTypeParam = assetTypeParam;
+      return JSON.stringify(cfg);
+    }
+    if (executeMode === "get_detail") {
+      return JSON.stringify(assetIdParam ? { assetIdParam } : {});
+    }
+    if (executeMode === "no_op") {
+      return JSON.stringify({ template: templateValue || "" });
+    }
+    return "{}";
+  }
+
+  async function load() {
+    const [skillPayload, deptPayload] = await Promise.all([
+      api<{ skills: SkillRow[] }>("/api/skills"),
+      api<{ departments: Department[] }>("/api/settings/departments")
+    ]);
+    setSkills(skillPayload.skills);
+    setDepartments(deptPayload.departments);
+  }
+
+  useEffect(() => {
+    if (!canManage) return;
+    load().catch((error) => message.error(error.message));
+  }, []);
+
+  function resetParamConfigForMode(mode: string) {
+    if (mode === "search_kb") {
+      const first = paramRows[0]?.name || "query";
+      skillForm.setFieldsValue({ queryParam: first, limitParam: undefined, assetTypeParam: undefined });
+    } else if (mode === "get_detail") {
+      const first = paramRows[0]?.name || "assetId";
+      skillForm.setFieldsValue({ assetIdParam: first });
+    } else if (mode === "no_op") {
+      skillForm.setFieldsValue({ template: "" });
+    }
+  }
+
+  function openCreate() {
+    setEditingSkill(null);
+    setModalOpen(true);
+    setTestArgs("{}");
+    setTestResult(null);
+    const initialParams = [{ uid: `row-${Date.now()}`, name: "query", description: "用户提问或关键词", required: true }];
+    setParamRows(initialParams);
+    skillForm.resetFields();
+    skillForm.setFieldsValue({
+      name: "",
+      displayName: "",
+      description: "",
+      executeMode: "search_kb",
+      enabled: true,
+      departmentId: user.departmentId || undefined,
+      queryParam: "query",
+      limitParam: undefined,
+      assetTypeParam: undefined,
+      assetIdParam: undefined,
+      template: "",
+      systemPrompt: ""
+    });
+  }
+
+  function openEdit(row: SkillRow) {
+    setEditingSkill(row);
+    setModalOpen(true);
+    setTestArgs("{}");
+    setTestResult(null);
+    let paramsObj: { type: string; properties?: Record<string, { type: string; description?: string }>; required?: string[] } = {
+      type: "object",
+      properties: {},
+      required: []
+    };
+    try {
+      const parsed = JSON.parse(row.parameters);
+      if (parsed && typeof parsed === "object" && parsed.type === "object") {
+        paramsObj = parsed;
+      }
+    } catch {
+      // keep default
+    }
+    const props = paramsObj.properties || {};
+    const required = Array.isArray(paramsObj.required) ? paramsObj.required : [];
+    const rows = Object.entries(props).map(([key, value], index) => ({
+      uid: `seed-${index}-${key}`,
+      name: key,
+      description: value?.description || "",
+      required: required.includes(key)
+    }));
+    if (!rows.length) rows.push({ uid: `seed-empty-${Date.now()}`, name: "query", description: "", required: true });
+    setParamRows(rows);
+
+    let configObj: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(row.executeConfig || "{}");
+      if (parsed && typeof parsed === "object") configObj = parsed as Record<string, string>;
+    } catch {
+      // ignore
+    }
+
+    skillForm.resetFields();
+    skillForm.setFieldsValue({
+      name: row.name,
+      displayName: row.displayName,
+      description: row.description,
+      executeMode: row.executeMode,
+      enabled: row.enabled,
+      departmentId: row.departmentId || undefined,
+      queryParam: configObj.queryParam || undefined,
+      limitParam: configObj.limitParam || undefined,
+      assetTypeParam: configObj.assetTypeParam || undefined,
+      assetIdParam: configObj.assetIdParam || undefined,
+      template: configObj.template || "",
+      systemPrompt: row.systemPrompt || ""
+    });
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setEditingSkill(null);
+    setTestResult(null);
+  }
+
+  function addParamRow() {
+    const uid = `row-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const next = [...paramRows, { uid, name: "", description: "", required: false }];
+    setParamRows(next);
+    resetParamConfigForMode(executeMode || "search_kb");
+  }
+
+  function removeParamRow(uid: string) {
+    const next = paramRows.filter((row) => row.uid !== uid);
+    setParamRows(next);
+    resetParamConfigForMode(executeMode || "search_kb");
+  }
+
+  function changeParamRow(uid: string, patch: Partial<{ name: string; description: string; required: boolean }>) {
+    const next = paramRows.map((row) => (row.uid === uid ? { ...row, ...patch } : row));
+    setParamRows(next);
+    resetParamConfigForMode(executeMode || "search_kb");
+  }
+
+  async function saveSkill() {
+    let values: {
+      name: string;
+      displayName: string;
+      description: string;
+      executeMode: string;
+      enabled: boolean;
+      departmentId?: string;
+      systemPrompt?: string;
+    };
+    try {
+      values = await skillForm.validateFields();
+    } catch {
+      return;
+    }
+    const mode = values.executeMode;
+    const paramNames = paramRows.map((r) => r.name).filter(Boolean);
+    if (!paramNames.length) {
+      message.error("请至少添加一个参数");
+      return;
+    }
+    if (mode === "search_kb") {
+      const qp = skillForm.getFieldValue("queryParam") as string;
+      if (!qp || !paramNames.includes(qp)) {
+        message.error("queryParam 必须选择已定义的参数");
+        return;
+      }
+    } else if (mode === "get_detail") {
+      const ap = skillForm.getFieldValue("assetIdParam") as string;
+      if (!ap || !paramNames.includes(ap)) {
+        message.error("assetIdParam 必须选择已定义的参数");
+        return;
+      }
+    } else if (mode === "no_op") {
+      const tpl = skillForm.getFieldValue("template") as string;
+      if (!tpl) {
+        message.error("no_op 模式需要填写 template");
+        return;
+      }
+    }
+    const payload: Record<string, unknown> = {
+      name: values.name,
+      displayName: values.displayName,
+      description: values.description,
+      parameters: buildParametersJson(),
+      executeMode: mode,
+      executeConfig: buildExecuteConfigJson(),
+      enabled: values.enabled,
+      systemPrompt: values.systemPrompt || null
+    };
+    if (isAdminUser || values.departmentId) {
+      payload.departmentId = values.departmentId || user.departmentId;
+    }
+    if (editingSkill) {
+      await api(`/api/skills/${editingSkill.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      message.success("技能已更新");
+    } else {
+      await api("/api/skills", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      message.success("技能已创建");
+    }
+    closeModal();
+    load();
+  }
+
+  async function runTest() {
+    if (!editingSkill) {
+      message.warning("请先保存技能后再测试");
+      return;
+    }
+    let parsedArgs: Record<string, unknown> = {};
+    try {
+      const raw = JSON.parse(testArgs || "{}");
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        parsedArgs = raw as Record<string, unknown>;
+      }
+    } catch (error) {
+      message.error(`测试参数 JSON 解析失败：${(error as Error).message}`);
+      return;
+    }
+    try {
+      const payload = await api<{ result: { ok: boolean; content: string; error?: string; meta?: Record<string, unknown> } }>(
+        `/api/skills/${editingSkill.id}/test`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ args: parsedArgs })
+        }
+      );
+      setTestResult(payload.result);
+      message.success("测试完成");
+    } catch (error) {
+      message.error((error as Error).message);
+    }
+  }
+
+  function confirmDelete(row: SkillRow) {
+    modal.confirm({
+      title: `删除技能「${row.displayName}」？`,
+      content: "删除后该技能将从可用列表移除(软删,可在 5 秒后重建同名)。",
+      okType: "danger",
+      onOk: async () => {
+        await api(`/api/skills/${row.id}`, { method: "DELETE" });
+        message.success("技能已删除");
+        if (editingSkill?.id === row.id) closeModal();
+        load();
+      }
+    });
+  }
+
+  if (!canManage) {
+    return <Card className="soft-card">当前账号无权限管理技能。</Card>;
+  }
+
+  const departmentOptions = departments.map((dept) => ({ value: dept.id, label: dept.name }));
+  const deptName = (id: string | null) => (id ? departments.find((dept) => dept.id === id)?.name || id : "未分配");
+  const modeLabel: Record<string, string> = {
+    search_kb: "搜索知识库",
+    get_detail: "读取资料详情",
+    no_op: "模板输出"
+  };
+  const paramNameOptions = paramRows.filter((row) => row.name).map((row) => ({ value: row.name, label: row.name }));
+  const currentMode = executeMode || "search_kb";
+
+  return (
+    <Space direction="vertical" size={18} style={{ width: "100%" }}>
+      <Card
+        className="soft-card"
+        title="技能列表"
+        extra={
+          <Space>
+            <Typography.Text type="secondary">仅显示本部门或可见的技能；内置技能不可编辑。</Typography.Text>
+            <Button type="primary" onClick={openCreate}>
+              新建技能
+            </Button>
+          </Space>
+        }
+      >
+        <Table
+          rowKey="id"
+          dataSource={skills}
+          pagination={{ pageSize: 8 }}
+          columns={[
+            { title: "名称", dataIndex: "name" },
+            { title: "显示名", dataIndex: "displayName" },
+            { title: "执行方式", render: (_, row) => <Tag color="blue">{modeLabel[row.executeMode] || row.executeMode}</Tag> },
+            { title: "状态", render: (_, row) => <Tag color={row.enabled ? "green" : "red"}>{row.enabled ? "启用" : "停用"}</Tag> },
+            { title: "部门", render: (_, row) => deptName(row.departmentId) },
+            { title: "更新", render: (_, row) => formatDateTime(row.updatedAt) },
+            {
+              title: "操作",
+              width: 200,
+              render: (_, row) => (
+                <Space>
+                  <Button size="small" onClick={() => openEdit(row)}>编辑</Button>
+                  <Button size="small" danger onClick={() => confirmDelete(row)}>删除</Button>
+                </Space>
+              )
+            }
+          ]}
+        />
+      </Card>
+      <Modal
+        open={modalOpen}
+        title={editingSkill ? `编辑技能：${editingSkill.displayName}` : "新建技能"}
+        width={720}
+        destroyOnHidden
+        onCancel={closeModal}
+        onOk={saveSkill}
+        okText="保存"
+        cancelText="取消"
+      >
+        <Form
+          form={skillForm}
+          layout="vertical"
+          onValuesChange={(changed) => {
+            if (changed.executeMode) resetParamConfigForMode(changed.executeMode);
+          }}
+        >
+          <Card size="small" title="① 选类型" style={{ marginBottom: 16, background: "#fafbfc" }}>
+            <Form.Item name="executeMode" rules={[{ required: true, message: "请选择类型" }]} style={{ marginBottom: 0 }}>
+              <Radio.Group buttonStyle="solid" size="large" style={{ width: "100%" }}>
+                <Radio.Button value="search_kb" style={{ width: "33.3%", textAlign: "center", height: "auto", padding: "12px 8px" }}>
+                  <Space direction="vertical" size={2} align="center">
+                    <span style={{ fontSize: 16 }}>📚 知识库搜索</span>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>拿用户问题搜资料</Typography.Text>
+                  </Space>
+                </Radio.Button>
+                <Radio.Button value="get_detail" style={{ width: "33.3%", textAlign: "center", height: "auto", padding: "12px 8px" }}>
+                  <Space direction="vertical" size={2} align="center">
+                    <span style={{ fontSize: 16 }}>📄 读取资料详情</span>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>拉某条资料全文</Typography.Text>
+                  </Space>
+                </Radio.Button>
+                <Radio.Button value="no_op" style={{ width: "33.4%", textAlign: "center", height: "auto", padding: "12px 8px" }}>
+                  <Space direction="vertical" size={2} align="center">
+                    <span style={{ fontSize: 16 }}>✏️ 模板输出</span>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>不查资料,直接拼</Typography.Text>
+                  </Space>
+                </Radio.Button>
+              </Radio.Group>
+            </Form.Item>
+          </Card>
+          <Card size="small" title="② 基础信息" style={{ marginBottom: 16 }}>
+            <Row gutter={16}>
+              <Col xs={24} md={12}>
+                <Form.Item name="name" label="技能名称" rules={[{ required: true, message: "请输入名称" }, { pattern: /^[a-zA-Z][a-zA-Z0-9_]*$/, message: "字母开头,只含字母数字下划线" }]}>
+                  <Input placeholder="例如 competitor_analysis" disabled={!!editingSkill} />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={12}>
+                <Form.Item name="displayName" label="显示名" rules={[{ required: true, message: "请输入显示名" }]}>
+                  <Input placeholder="例如 竞品分析" />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item name="description" label="一句话告诉模型,啥时候该用这个技能" rules={[{ required: true, message: "请填写描述" }]}>
+              <Input placeholder="例如:用户问竞品对比、价格段位时调用" />
+            </Form.Item>
+            <Row gutter={16}>
+              <Col xs={24} md={12}>
+                <Form.Item name="departmentId" label="归属部门">
+                  <Select allowClear options={departmentOptions} placeholder="默认本部门" />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={12}>
+                <Form.Item name="enabled" label="启用" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+              </Col>
+            </Row>
+          </Card>
+          <Card size="small" title="③ 参数(模型调用时传进来的字段)" style={{ marginBottom: 16 }}>
+            <Table
+              rowKey="uid"
+              dataSource={paramRows}
+              pagination={false}
+              size="small"
+              columns={[
+                {
+                  title: "参数名",
+                  width: 160,
+                  render: (_, row) => (
+                    <Input
+                      value={row.name}
+                      placeholder="例如 query"
+                      onChange={(e) => changeParamRow(row.uid, { name: e.target.value })}
+                    />
+                  )
+                },
+                {
+                  title: "说明(给模型看)",
+                  render: (_, row) => (
+                    <Input
+                      value={row.description}
+                      placeholder="例如 用户的问题原文"
+                      onChange={(e) => changeParamRow(row.uid, { description: e.target.value })}
+                    />
+                  )
+                },
+                {
+                  title: "必填",
+                  width: 80,
+                  render: (_, row) => (
+                    <Switch
+                      checked={row.required}
+                      onChange={(checked) => changeParamRow(row.uid, { required: checked })}
+                    />
+                  )
+                },
+                {
+                  title: "操作",
+                  width: 70,
+                  render: (_, row) => (
+                    <Button size="small" danger onClick={() => removeParamRow(row.uid)} disabled={paramRows.length <= 1}>
+                      删除
+                    </Button>
+                  )
+                }
+              ]}
+            />
+            <Button onClick={addParamRow} style={{ marginTop: 8 }}>+ 新增参数</Button>
+          </Card>
+          <Card size="small" title="④ 模式配置" style={{ marginBottom: 16 }}>
+            {currentMode === "search_kb" && (
+              <Row gutter={16}>
+                <Col xs={24} md={8}>
+                  <Form.Item label="把哪个参数当查询词" required>
+                    <Select
+                      value={queryParam}
+                      onChange={(value) => skillForm.setFieldValue("queryParam", value)}
+                      options={paramNameOptions}
+                      placeholder="选择参数"
+                    />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} md={8}>
+                  <Form.Item label="返回条数(可选)">
+                    <Select
+                      value={limitParam}
+                      onChange={(value) => skillForm.setFieldValue("limitParam", value)}
+                      options={[{ value: "", label: "(不指定)" }, ...paramNameOptions]}
+                      placeholder="(不指定)"
+                      allowClear
+                    />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} md={8}>
+                  <Form.Item label="资料类型筛选(可选)">
+                    <Select
+                      value={assetTypeParam}
+                      onChange={(value) => skillForm.setFieldValue("assetTypeParam", value)}
+                      options={[{ value: "", label: "(不指定)" }, ...paramNameOptions]}
+                      placeholder="(不指定)"
+                      allowClear
+                    />
+                  </Form.Item>
+                </Col>
+              </Row>
+            )}
+            {currentMode === "get_detail" && (
+              <Form.Item label="把哪个参数当资料 ID" required>
+                <Select
+                  value={assetIdParam}
+                  onChange={(value) => skillForm.setFieldValue("assetIdParam", value)}
+                  options={paramNameOptions}
+                  placeholder="选择参数"
+                />
+              </Form.Item>
+            )}
+            {currentMode === "no_op" && (
+              <Form.Item label="输出模板" required extra="支持 {{args.x}} 占位符,运行时用真实参数替换">
+                <Input.TextArea
+                  rows={6}
+                  value={templateValue}
+                  onChange={(e) => skillForm.setFieldValue("template", e.target.value)}
+                  placeholder="例如:你正在分析 {{args.brand}},请用 3 点说明其卖点。"
+                />
+              </Form.Item>
+            )}
+          </Card>
+          <Collapse
+            ghost
+            items={[
+              {
+                key: "advanced",
+                label: <Typography.Text type="secondary">高级设置(系统提示词 / 测试)</Typography.Text>,
+                children: (
+                  <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                    <Form.Item name="systemPrompt" label="系统提示词(可选)" extra="拼接在返回内容开头,约束输出风格">
+                      <Input.TextArea rows={4} placeholder="例如:请基于资料,使用中文分点总结。" />
+                    </Form.Item>
+                    <Card size="small" title="测试" type="inner">
+                      <Form.Item label="测试参数 (JSON 对象)">
+                        <Input.TextArea rows={3} value={testArgs} onChange={(e) => setTestArgs(e.target.value)} spellCheck={false} />
+                      </Form.Item>
+                      <Button type="primary" onClick={runTest} disabled={!editingSkill}>
+                        立即执行
+                      </Button>
+                      {testResult && (
+                        <Card size="small" style={{ marginTop: 12 }} title={testResult.ok ? "✅ 执行成功" : "❌ 执行失败"}>
+                          <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
+                            {testResult.content || testResult.error || "(无返回内容)"}
+                          </Typography.Paragraph>
+                          {testResult.meta && Object.keys(testResult.meta).length > 0 && (
+                            <details style={{ marginTop: 12 }}>
+                              <summary>查看 meta</summary>
+                              <pre style={{ background: "#f5f5f5", padding: 8, borderRadius: 4, marginTop: 8 }}>
+                                {JSON.stringify(testResult.meta, null, 2)}
+                              </pre>
+                            </details>
+                          )}
+                        </Card>
+                      )}
+                    </Card>
+                    <Card size="small" title="当前完整 JSON(给开发/管理员核对)" type="inner">
+                      <pre style={{ background: "#f5f5f5", padding: 8, borderRadius: 4, marginBottom: 8, fontSize: 12 }}>
+{`parameters: ${buildParametersJson()}\n\nexecuteConfig: ${buildExecuteConfigJson()}\n\nsystemPrompt: ${JSON.stringify(systemPrompt || "")}`}
+                      </pre>
+                    </Card>
+                  </Space>
+                )
+              }
+            ]}
+          />
+        </Form>
+      </Modal>
+    </Space>
+  );
 }

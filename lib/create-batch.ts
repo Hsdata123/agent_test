@@ -4,6 +4,7 @@ import { runTask } from "./generation";
 import { prisma } from "./prisma";
 import { DEFAULT_DETAIL_PROMPT_TEMPLATE, DEFAULT_MAIN_PROMPT_TEMPLATE } from "./prompts";
 import { publicFileUrl } from "./storage";
+import { getEffectiveDepartmentId, isAdmin } from "./dept-scope";
 
 export async function createBatchGeneration(user: User, body: Record<string, any>) {
   const tasks = await createGenerationTasks(user, body);
@@ -30,14 +31,17 @@ export async function createGenerationTasks(user: User, body: Record<string, any
   const fullPromptOverrides = typeof config.fullPromptOverrides === "object" && config.fullPromptOverrides ? config.fullPromptOverrides : {};
   const mainTemplateAssetId = typeof config.mainTemplateAssetId === "string" ? config.mainTemplateAssetId : undefined;
   const portraitAssetId = typeof config.portraitAssetId === "string" ? config.portraitAssetId : undefined;
+  const knowledgeEnhanced = config.knowledgeEnhanced === true;
+  const effectiveDeptId = getEffectiveDepartmentId(user);
+  const deptScope = isAdmin(user) ? {} : { departmentId: effectiveDeptId };
   const mainTemplateAsset = mainTemplateAssetId
     ? await prisma.knowledgeAsset.findFirst({
-        where: { id: mainTemplateAssetId, assetType: "main_template", enabled: true }
+        where: { id: mainTemplateAssetId, assetType: "main_template", enabled: true, ...deptScope }
       })
     : null;
   const portraitAsset = portraitAssetId
     ? await prisma.knowledgeAsset.findFirst({
-        where: { id: portraitAssetId, assetType: "portrait_white_image", enabled: true }
+        where: { id: portraitAssetId, assetType: "portrait_white_image", enabled: true, ...deptScope }
       })
     : null;
 
@@ -62,6 +66,7 @@ export async function createGenerationTasks(user: User, body: Record<string, any
             templateAssetId: mainTemplateAsset?.id,
             imageSize: mainImageSize,
             imageQuality,
+            knowledgeEnhanced,
             prompt: portraitAsset ? mainPromptPayload(mainPrompt, portraitAsset.id) : mainPrompt
           }
         })
@@ -81,6 +86,7 @@ export async function createGenerationTasks(user: User, body: Record<string, any
             imageCount: detailPageCount,
             imageSize: detailImageSize,
             imageQuality,
+            knowledgeEnhanced,
             prompt: detailPromptConfig || detailPromptTemplate || DEFAULT_DETAIL_PROMPT_TEMPLATE
           }
         })
