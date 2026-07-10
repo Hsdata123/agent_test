@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { roleHasPermission } from "@/lib/roles";
 import { canEditAsset, isAdmin } from "@/lib/dept-scope";
 import { serializeScenes } from "@/lib/scenes";
+import { parseExcelPreview } from "@/lib/excel-preview";
 
 function listToJson(value: unknown) {
   if (Array.isArray(value)) return JSON.stringify(value.map(String).filter(Boolean));
@@ -23,7 +24,12 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     if (!isAdmin(user) && asset.departmentId && asset.departmentId !== user.departmentId) {
       throw Object.assign(new Error("无权访问其他部门资料"), { status: 403 });
     }
-    return NextResponse.json({ success: true, asset: { ...asset, fileUrl: publicFileUrl(asset.storagePath) } });
+    // Excel 类资料附带预览 (从 extractedText 解析, 与上传时一致), 前端「查看预览」按钮可直接渲染
+    const preview = asset.assetType === "excel" && asset.extractedText ? parseExcelPreview(asset.extractedText) : null;
+    return NextResponse.json({
+      success: true,
+      asset: { ...asset, fileUrl: publicFileUrl(asset.storagePath), preview }
+    });
   } catch (error) {
     return jsonError(error);
   }
@@ -63,10 +69,19 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     }
     const asset = await prisma.knowledgeAsset.update({ where: { id }, data });
     if (aliases) {
-      await prisma.productAlias.deleteMany({ where: { assetId: id } });
-      for (const alias of JSON.parse(aliases) as string[]) {
-        await prisma.productAlias.create({ data: { alias, assetId: id } });
+      let aliasList: string[] = [];
+      try {
+        const parsed = JSON.parse(aliases);
+        aliasList = Array.isArray(parsed) ? parsed.map((item) => String(item).trim()).filter(Boolean) : [];
+      } catch {
+        throw Object.assign(new Error("aliases 格式错误，必须为 JSON 数组"), { status: 400 });
       }
+      await prisma.$transaction([
+        prisma.productAlias.deleteMany({ where: { assetId: id } }),
+        ...aliasList.map((alias) =>
+          prisma.productAlias.create({ data: { alias, assetId: id } })
+        )
+      ]);
     }
     return NextResponse.json({ success: true, asset });
   } catch (error) {
