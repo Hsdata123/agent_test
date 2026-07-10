@@ -1,14 +1,17 @@
 import type { Skill as PrismaSkill } from "@prisma/client";
+import { runPythonHandler } from "./sandbox/runner";
 import { getSkill } from "./registry";
 import type { JsonSchema, Skill, SkillContext, SkillDefinition, SkillResult } from "./types";
 
 export type UserSkillConfig = {
-  executeMode?: "search_kb" | "get_detail" | "no_op";
+  executeMode?: "search_kb" | "get_detail" | "no_op" | "exec_function";
   queryParam?: string;
   limitParam?: string;
   assetTypeParam?: string;
   assetIdParam?: string;
   template?: string;
+  /** exec_function 模式专用: Python 源码, 必须定义 def handler(**kwargs) -> dict */
+  handler?: string;
 };
 
 export type UserSkillRow = Pick<
@@ -120,7 +123,25 @@ async function runExecute(
     const template = config.template || "";
     return { ok: true, content: renderTemplate(template, args) };
   }
+  if (mode === "exec_function") {
+    return runExecFunction(config.handler || "", args);
+  }
   return { ok: false, content: "", error: `不支持的 executeMode: ${mode}` };
+}
+
+async function runExecFunction(handler: string, args: Record<string, unknown>): Promise<ExecuteResult> {
+  if (!handler.trim()) {
+    return { ok: false, content: "", error: "缺少 handler 字段" };
+  }
+  const result = await runPythonHandler(handler, args);
+  if (result.ok) {
+    return {
+      ok: true,
+      content: JSON.stringify(result.data, null, 2),
+      meta: { data: result.data, durationMs: result.durationMs }
+    };
+  }
+  return { ok: false, content: "", error: `exec_function: ${result.error}` };
 }
 
 async function invoke(skill: Skill, mapped: Record<string, unknown>, ctx: SkillContext): Promise<ExecuteResult> {

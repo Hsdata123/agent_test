@@ -5,8 +5,21 @@ import { usePathname, useRouter } from "next/navigation";
 import { type Key, useEffect, useMemo, useState } from "react";
 import type { ExcelPreview } from "@/lib/excel-preview";
 import { Markdown } from "@/components/Markdown";
+import { resolveCacheProfile, DEFAULT_RETENTION, DEFAULT_CACHE_KEY } from "@/lib/model-cache-profiles";
+import {
+  ComposedChart,
+  Bar,
+  Line,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  CartesianGrid,
+  Legend
+} from "recharts";
+import { Tooltip as RechartsTooltip } from "recharts";
 import {
   App,
+  Alert,
   Avatar,
   Button,
   Card,
@@ -14,7 +27,9 @@ import {
   Col,
   ConfigProvider,
   Descriptions,
+  Divider,
   Drawer,
+  Dropdown,
   Form,
   Image,
   Input,
@@ -35,7 +50,9 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 
-type User = { id: string; username: string; nickname: string; role: string; status: string; departmentId?: string | null; permissions?: string[] };
+type User = { id: string; username: string; nickname: string; role: string; status: string; departmentId?: string | null; advertiserId?: string | null; permissions?: string[] };
+type AdvertiserBinding = { advertiserId: string; isPrimary: boolean; createdAt: string };
+type AdvertiserList = { activeAdvertiserId: string | null; bindings: AdvertiserBinding[] };
 type RoleDefinition = { key: string; name: string; permissions: string[]; system: boolean };
 type ChatMessage = {
   id: string;
@@ -73,14 +90,23 @@ type ChatErrorDetails = {
 };
 type ChatDebug = {
   useKnowledgeSwitch: boolean;
-  usedPath: "manual" | "auto" | "none";
+  useQianchuanSwitch?: boolean;
+  usedPath: "manual" | "auto" | "skill" | "none";
   intentScenes: Array<{ sceneKey: string; sceneName: string; score: number }>;
   ranked: Array<{ id: string; assetName: string; assetType: string; score: number; scenes: string[] }>;
   baseAssetCount: number;
   contextCharCount: number;
   contextPreview?: string;
+  skillCalls?: Array<{ id?: string; name?: string; ok?: boolean; matchedAssets?: Array<{ id: string }> }>;
 };
-type ChatConversationSummary = { id: string; projectId: string; title: string; createdAt: string; updatedAt: string };
+type ChatConversationSummary = {
+  id: string;
+  projectId: string;
+  title: string;
+  prefsJson?: string;
+  createdAt: string;
+  updatedAt: string;
+};
 type ChatProjectSummary = { id: string; name: string; createdAt: string; updatedAt: string; conversations: ChatConversationSummary[] };
 type ChatConversationPrefs = {
   keyword: string;
@@ -88,14 +114,18 @@ type ChatConversationPrefs = {
   selectedAssetIds: Key[];
   useAll: boolean;
   useKnowledge: boolean;
+  useQianchuan: boolean;
   question: string;
 };
+// 从 prefsJson 解析出来的持久化字段 (DB 存的就是这两个开关, 其它字段是会话级临时)
+type ChatConversationPersistedPrefs = Pick<ChatConversationPrefs, "useKnowledge" | "useQianchuan">;
 const DEFAULT_CHAT_PREFS: ChatConversationPrefs = {
   keyword: "",
   chatAssetType: "all",
   selectedAssetIds: [],
   useAll: false,
   useKnowledge: false,
+  useQianchuan: true,
   question: ""
 };
 type Project = {
@@ -261,15 +291,28 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
 
 export function Dashboard({ view, projectId }: { view: "chatProjects" | "projects" | "project" | "knowledge" | "records" | "settings"; projectId?: string }) {
   const [user, setUser] = useState<User | null>(null);
+  const [advertiserList, setAdvertiserList] = useState<AdvertiserList>({
+    activeAdvertiserId: null,
+    bindings: []
+  });
   const router = useRouter();
   const pathname = usePathname();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
 
   useEffect(() => {
     api<{ user: User | null }>("/api/auth/me")
-      .then((payload) => {
-        if (!payload.user) router.push("/login");
+      .then(async (payload) => {
+        if (!payload.user) {
+          router.push("/login");
+          return;
+        }
         setUser(payload.user);
+        try {
+          const adv = await api<AdvertiserList>("/api/me/advertiser");
+          setAdvertiserList(adv);
+        } catch {
+          setAdvertiserList({ activeAdvertiserId: null, bindings: [] });
+        }
       })
       .catch(() => router.push("/login"));
   }, [router]);
@@ -277,6 +320,19 @@ export function Dashboard({ view, projectId }: { view: "chatProjects" | "project
   async function logout() {
     await fetch("/api/auth/logout", { method: "POST" });
     router.push("/login");
+  }
+
+  async function switchAdvertiser(advertiserId: string) {
+    try {
+      await api("/api/me/advertiser", {
+        method: "POST",
+        body: JSON.stringify({ advertiserId })
+      });
+      message.success(`已切换到广告主 ${advertiserId}`);
+      window.location.reload();
+    } catch (e) {
+      message.error((e as Error).message || "切换失败");
+    }
   }
 
   if (!user) return null;
@@ -301,6 +357,31 @@ export function Dashboard({ view, projectId }: { view: "chatProjects" | "project
           <Avatar>{user.nickname.slice(0, 1)}</Avatar>
           <span>{user.nickname}</span>
           <Tag color={user.role === "admin" ? "purple" : "blue"}>{roleLabel(user.role)}</Tag>
+          {advertiserList.bindings.length > 0 ? (
+            <Dropdown
+              menu={{
+                items: advertiserList.bindings.map((b) => ({
+                  key: b.advertiserId,
+                  label: (
+                    <span>
+                      {b.advertiserId}
+                      {b.isPrimary ? " ⭐" : ""}
+                      {b.advertiserId === advertiserList.activeAdvertiserId ? " ✓" : ""}
+                    </span>
+                  )
+                })),
+                onClick: ({ key }) => {
+                  if (key !== advertiserList.activeAdvertiserId) switchAdvertiser(String(key));
+                }
+              }}
+            >
+              <Tag color="cyan" style={{ cursor: "pointer" }}>
+                广告主：{advertiserList.activeAdvertiserId || "未绑定"} ▾
+              </Tag>
+            </Dropdown>
+          ) : (
+            <Tag color="default">广告主：未绑定</Tag>
+          )}
           <Button onClick={logout}>
             退出
           </Button>
@@ -343,7 +424,7 @@ function ProjectsView() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [open, setOpen] = useState(false);
   const [form] = Form.useForm();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
 
   async function load() {
     const payload = await api<{ projects: Project[] }>("/api/projects");
@@ -439,7 +520,7 @@ function ProjectsView() {
 
 function ChatProcessLog({ entries }: { entries: ProcessLogEntry[] }) {
   const [openIndex, setOpenIndex] = useState<number | null>(null);
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   if (!entries.length) return null;
   return (
     <div className="chat-process-log">
@@ -598,7 +679,11 @@ function ChatDebugPanel({ debug }: { debug: ChatDebug }) {
         ) : (
           <Tag color="default" style={{ fontSize: 13, padding: "2px 10px" }}>
             ❌ 未调用知识库
-            {debug.useKnowledgeSwitch ? "（已开启开关但本部门无匹配资料）" : "（未打开「使用知识库」开关）"}
+            {!debug.useKnowledgeSwitch
+              ? "（未打开「使用知识库」开关）"
+              : debug.usedPath === "skill" && !(debug.skillCalls?.length ?? 0)
+                ? "（本轮未触发知识库检索）"
+                : "（已开启开关但本部门无匹配资料）"}
           </Tag>
         )}
         {usedKB ? (
@@ -638,7 +723,9 @@ function ChatDebugPanel({ debug }: { debug: ChatDebug }) {
                       <Tag color="cyan">资料{index + 1}</Tag>
                       <Typography.Text strong>{entry.assetName}</Typography.Text>
                       <Tag>{assetTypeLabel(entry.assetType)}</Tag>
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>score {entry.score}</Typography.Text>
+                      {entry.score > 0 ? (
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>score {entry.score}</Typography.Text>
+                      ) : null}
                       {entry.scenes.length ? (
                         <Space size={4}>
                           {entry.scenes.map((scene) => (
@@ -649,16 +736,18 @@ function ChatDebugPanel({ debug }: { debug: ChatDebug }) {
                     </div>
                   ))}
                 </Space>
-              ) : (
-                <Typography.Text type="secondary">手动路径拉取了 {manualRefs} 条资料。</Typography.Text>
-              )}
+              ) : manualRefs > 0 ? (
+                <Typography.Text type="secondary">
+                  {debug.usedPath === "manual" ? "手动" : "技能"}路径拉取了 {manualRefs} 条资料。
+                </Typography.Text>
+              ) : null}
             </div>
           ) : (
             <div className="chat-debug-detail">
               <Descriptions size="small" column={2} style={{ marginTop: 8 }}>
                 <Descriptions.Item label="KB 开关">{debug.useKnowledgeSwitch ? "开" : "关"}</Descriptions.Item>
                 <Descriptions.Item label="调用路径">
-                  {debug.usedPath === "auto" ? "部门 KB 检索" : debug.usedPath === "manual" ? "手动选用" : "未调用"}
+                  {debug.usedPath === "auto" ? "部门 KB 检索" : debug.usedPath === "manual" ? "手动选用" : debug.usedPath === "skill" ? "技能检索 KB" : "未调用"}
                 </Descriptions.Item>
                 <Descriptions.Item label="命中场景" span={2}>{intentNames}</Descriptions.Item>
                 <Descriptions.Item label="命中条数">{hasRefs || manualRefs}</Descriptions.Item>
@@ -718,11 +807,32 @@ function ChatProjectsView() {
       ...current,
       [activeConversationId]: { ...(current[activeConversationId] || DEFAULT_CHAT_PREFS), ...patch }
     }));
+    // useKnowledge/useQianchuan 是持久化字段, 改动后立刻 PATCH 到 DB,
+    // 这样切换/新建对话后该对话仍沿用本次设置.
+    if (typeof patch.useKnowledge === "boolean" || typeof patch.useQianchuan === "boolean") {
+      const next = { ...(activePrefs), ...patch };
+      api(`/api/chat-conversations/${activeConversationId}/prefs`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ useKnowledge: next.useKnowledge, useQianchuan: next.useQianchuan })
+      }).catch((error) => message.error(`保存偏好失败：${error.message}`));
+    }
   }
 
   async function loadChatProjects(preferredConversationId = activeConversationId) {
     const payload = await api<{ projects: ChatProjectSummary[] }>("/api/chat-projects");
     setChatProjects(payload.projects);
+    // 把每个对话的持久化 prefs (useKnowledge/useQianchuan) 灌入 chatPrefs, 后续访问该对话直接沿用.
+    setChatPrefs((current) => {
+      const next = { ...current };
+      for (const project of payload.projects) {
+        for (const conversation of project.conversations) {
+          const persisted = parsePersistedPrefs(conversation.prefsJson);
+          next[conversation.id] = { ...DEFAULT_CHAT_PREFS, ...next[conversation.id], ...persisted };
+        }
+      }
+      return next;
+    });
     const preferredProject = payload.projects.find((project) => project.conversations.some((conversation) => conversation.id === preferredConversationId));
     const nextProject = preferredProject || payload.projects.find((project) => project.id === activeChatProjectId) || payload.projects[0];
     setActiveChatProjectId(nextProject?.id);
@@ -738,7 +848,41 @@ function ChatProjectsView() {
 
   async function loadConversation(conversationId: string) {
     const payload = await api<{ messages: ChatMessage[] }>(`/api/chat-conversations/${conversationId}`);
-    setChatMessages(payload.messages.map((item) => ({ id: item.id, role: item.role, content: item.content })));
+    setChatMessages(
+      payload.messages.map((item) => {
+        const dbItem = item as ChatMessage & {
+          processLog?: string | null;
+          finalDebug?: string | null;
+          finalAssets?: string | null;
+        };
+        return {
+          id: dbItem.id,
+          role: dbItem.role,
+          content: dbItem.content,
+          createdAt: dbItem.createdAt,
+          processLog: parseJsonField<ProcessLogEntry[]>(dbItem.processLog, []),
+          finalDebug: parseJsonField<ChatDebug>(dbItem.finalDebug),
+          finalAssets: parseJsonField<Array<{ id: string; assetName: string; assetType: string }>>(dbItem.finalAssets)
+        };
+      })
+    );
+  }
+
+  function parseJsonField<T>(value: string | null | undefined, fallback?: T): T | undefined {
+    if (!value) return fallback;
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function parsePersistedPrefs(raw: string | null | undefined): ChatConversationPersistedPrefs {
+    const parsed = parseJsonField<Partial<ChatConversationPersistedPrefs>>(raw, {}) || {};
+    return {
+      useKnowledge: typeof parsed.useKnowledge === "boolean" ? parsed.useKnowledge : DEFAULT_CHAT_PREFS.useKnowledge,
+      useQianchuan: typeof parsed.useQianchuan === "boolean" ? parsed.useQianchuan : DEFAULT_CHAT_PREFS.useQianchuan
+    };
   }
 
   async function loadAssets(nextKeyword = activePrefs.keyword, nextAssetType = activePrefs.chatAssetType) {
@@ -782,6 +926,7 @@ function ChatProjectsView() {
           message: currentQuestion,
           useAll: activePrefs.useAll,
           useKnowledge: activePrefs.useKnowledge,
+          useQianchuan: activePrefs.useQianchuan,
           assetIds: activePrefs.selectedAssetIds,
           assetType: activePrefs.chatAssetType,
           conversationId: activeConversationId
@@ -883,7 +1028,10 @@ function ChatProjectsView() {
         finalAssets
       }));
       if (!aborted) {
-        loadChatProjects(activeConversationId).catch((error) => message.error(error.message));
+        // 只刷新侧边栏项目列表(标题/时间),不重载当前对话消息 —— 会冲掉 processLog
+        api<{ projects: ChatProjectSummary[] }>("/api/chat-projects")
+          .then((payload) => setChatProjects(payload.projects))
+          .catch((error) => message.error(error.message));
       }
     } catch (error) {
       const errorMessage = (error as Error).message;
@@ -1194,6 +1342,14 @@ function ChatProjectsView() {
                     onChange={(value) => patchActivePrefs({ useKnowledge: value })}
                     checkedChildren="使用知识库"
                     unCheckedChildren="不使用知识库"
+                  />
+                </Tooltip>
+                <Tooltip title="开启后，对话可调用巨量千川实时数据技能（账户/抖音号/直播间数据）。需管理员先在「设置 → 千川接入」绑定账号">
+                  <Switch
+                    checked={activePrefs.useQianchuan}
+                    onChange={(value) => patchActivePrefs({ useQianchuan: value })}
+                    checkedChildren="实时千川数据"
+                    unCheckedChildren="仅知识库"
                   />
                 </Tooltip>
                 <Typography.Text type="secondary">
@@ -2036,7 +2192,7 @@ function appendReferencePromptPreview(prompt: string, references: Array<{ role: 
 }
 
 function TaskResults({ tasks, onRefresh }: { tasks: GenerationTask[]; onRefresh: () => void }) {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const [selectedResultIds, setSelectedResultIds] = useState<Key[]>([]);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -2188,6 +2344,15 @@ function KnowledgeView({ user }: { user: User }) {
   const [filterDepartmentId, setFilterDepartmentId] = useState<string | "all">("all");
   const watchedDepartmentId = Form.useWatch("departmentId", form);
   const [excelPreview, setExcelPreview] = useState<Asset | null>(null);
+  async function openAssetPreview(row: Asset) {
+    // 列表接口不带 preview, 调详情接口拿 (含 Excel 预览)
+    try {
+      const payload = await api<{ asset: Asset }>(`/api/knowledge/assets/${row.id}`);
+      setExcelPreview(payload.asset);
+    } catch (error) {
+      message.error(`加载预览失败：${(error as Error).message}`);
+    }
+  }
   const { message, modal } = App.useApp();
   const isAdmin = user.role === "admin";
 
@@ -2455,7 +2620,7 @@ function KnowledgeView({ user }: { user: User }) {
                 return (
                   <Space size={4}>
                     {row.assetType === "excel" && (
-                      <Button size="small" onClick={() => setExcelPreview(row)}>
+                      <Button size="small" onClick={() => openAssetPreview(row)}>
                         查看预览
                       </Button>
                     )}
@@ -2544,6 +2709,50 @@ function KnowledgeView({ user }: { user: User }) {
       </Drawer>
       <ExcelPreviewModal asset={excelPreview} onClose={() => setExcelPreview(null)} />
     </Space>
+  );
+}
+
+function ApiConfigCachePreview({ form }: { form: ReturnType<typeof Form.useForm>[0] }) {
+  const baseUrl = Form.useWatch("textBaseUrl", form) as string | undefined;
+  const model = Form.useWatch("textModel", form) as string | undefined;
+  const wireApi = Form.useWatch("textWireApi", form) as string | undefined;
+  const enabled = Form.useWatch("textPromptCacheEnabled", form) as boolean | undefined;
+  const retention = Form.useWatch("textPromptCacheRetention", form) as string | undefined;
+  const cacheKey = Form.useWatch("textPromptCacheKey", form) as string | undefined;
+  const profile = resolveCacheProfile({
+    baseUrl: baseUrl || "",
+    chatModel: model || "",
+    wireApi: wireApi || "auto",
+    userEnabled: enabled !== false,
+    retention: retention || DEFAULT_RETENTION,
+    cacheKey: cacheKey || DEFAULT_CACHE_KEY
+  });
+  const color =
+    profile.mode === "disabled" ? "default" :
+    profile.mode === "anthropic_ephemeral" ? "purple" :
+    profile.mode === "openai_responses" ? "blue" : "cyan";
+  return (
+    <Alert
+      style={{ marginBottom: 16 }}
+      type={profile.mode === "disabled" ? "warning" : "info"}
+      showIcon
+      message={
+        <Space wrap>
+          <Typography.Text strong>当前生效的 Prompt Cache 配置：</Typography.Text>
+          <Tag color={color}>{profile.label}</Tag>
+          {profile.note ? <Typography.Text type="secondary">· {profile.note}</Typography.Text> : null}
+        </Space>
+      }
+      description={
+        profile.mode === "disabled"
+          ? "管理员已禁用缓存。所有分支不会传 cache, 任何 prompt cache 都不会命中."
+          : profile.mode === "anthropic_ephemeral"
+            ? `服务端会在 system 提示词 + 工具定义上各放一个 ephemeral cache 断点, TTL=${profile.retention}. 切换 baseUrl 或 chatModel 后这里会自动重新计算.`
+            : profile.mode === "openai_responses"
+              ? `OpenAI Responses 协议: 透传 prompt_cache_retention=${profile.retention} + prompt_cache_key=${profile.promptCacheKey}.`
+              : `OpenAI Chat Completions: 透传 prompt_cache_key=${profile.promptCacheKey} (本协议 retention 字段不一定生效).`
+      }
+    />
   );
 }
 
@@ -2662,7 +2871,7 @@ function RecordsView({ user }: { user: User }) {
   const [recordChatProjectId, setRecordChatProjectId] = useState("all");
   const [recordConversationId, setRecordConversationId] = useState("all");
   const [selectedChatRecord, setSelectedChatRecord] = useState<ChatRecord | null>(null);
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
 
   async function loadRecords() {
     const params = new URLSearchParams({
@@ -2867,15 +3076,40 @@ function SettingsView({ user }: { user: User }) {
   const [userForm] = Form.useForm();
   const [editUserForm] = Form.useForm();
   const [roleForm] = Form.useForm();
+  const [qianchuanForm] = Form.useForm();
   const [users, setUsers] = useState<User[]>([]);
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [roles, setRoles] = useState<RoleDefinition[]>([]);
+  const [qianchuanTokens, setQianchuanTokens] = useState<Array<{
+    id: string;
+    appId: string;
+    scope: string | null;
+    lastRefreshAt: string | null;
+    lastError: string | null;
+    accessTokenExpireAt: string;
+    refreshTokenExpireAt: string;
+    createdAt: string;
+    updatedAt: string;
+    accessTokenMasked: string | null;
+    refreshTokenMasked: string | null;
+    accessTokenStatus: "valid" | "expired";
+    refreshTokenStatus: "valid" | "expired";
+    advertisers: Array<{ id: string; advertiserId: string; nickname: string | null; createdAt: string }>;
+  }>>([]);
+  const [bindAdvertiserForm] = Form.useForm();
   const [departments, setDepartments] = useState<Department[]>([]);
   const [usageRows, setUsageRows] = useState<UsageRow[]>([]);
   const [usageUserId, setUsageUserId] = useState("all");
   const [usagePeriod, setUsagePeriod] = useState("day");
   const [usageAnchorDate, setUsageAnchorDate] = useState(todayDate());
-  const { message } = App.useApp();
+  const [cacheStats, setCacheStats] = useState<{
+    days: number;
+    daily: Array<{ date: string; promptTokens: number; cachedTokens: number; cacheHitRate: number; savedCost: number }>;
+    totals: { promptTokens: number; cachedTokens: number; cacheHitRate: number; savedCost: number };
+    byKey: Array<{ cacheKey: string; promptTokens: number; cachedTokens: number; cacheHitRate: number }>;
+    alert?: { level: "warning" | "critical"; message: string };
+  } | null>(null);
+  const { message, modal } = App.useApp();
 
   async function load() {
     if (user.role !== "admin") return;
@@ -2892,6 +3126,12 @@ function SettingsView({ user }: { user: User }) {
     await loadUsage();
   }
 
+  async function loadQianchuan() {
+    if (user.role !== "admin" && !user.permissions?.includes("manage_settings")) return;
+    const payload = await api<{ tokens: typeof qianchuanTokens }>("/api/settings/qianchuan");
+    setQianchuanTokens(payload.tokens);
+  }
+
   async function loadUsage(nextUserId = usageUserId, nextPeriod = usagePeriod, nextAnchorDate = usageAnchorDate) {
     if (user.role !== "admin") return;
     const payload = await api<{ rows: UsageRow[] }>(
@@ -2900,13 +3140,254 @@ function SettingsView({ user }: { user: User }) {
     setUsageRows(payload.rows);
   }
 
+  async function loadCacheStats(nextUserId = usageUserId) {
+    if (user.role !== "admin") return;
+    try {
+      const payload = await api<typeof cacheStats>(
+        `/api/settings/usage/cache-stats?userId=${encodeURIComponent(nextUserId)}&days=30`
+      );
+      setCacheStats(payload);
+    } catch (error) {
+      setCacheStats(null);
+      console.warn("[usage] cache-stats load failed", (error as Error).message);
+    }
+  }
+
   useEffect(() => {
     load().catch((error) => message.error(error.message));
+    loadQianchuan().catch(() => undefined);
   }, []);
 
   useEffect(() => {
     loadUsage().catch((error) => message.error(error.message));
+    loadCacheStats().catch(() => undefined);
   }, [usageUserId, usagePeriod, usageAnchorDate]);
+
+  async function bindQianchuanToken(values: {
+    appId: number | string;
+    appSecret: string;
+    authCode?: string;
+    accessToken?: string;
+    refreshToken?: string;
+    accessTokenExpireAt?: string;
+    refreshTokenExpireAt?: string;
+  }) {
+    const body: Record<string, unknown> = {
+      appId: String(values.appId),
+      appSecret: values.appSecret
+    };
+    if (values.authCode) body.authCode = values.authCode;
+    if (values.accessToken) body.accessToken = values.accessToken;
+    if (values.refreshToken) body.refreshToken = values.refreshToken;
+    if (values.accessTokenExpireAt) body.accessTokenExpireAt = new Date(values.accessTokenExpireAt).toISOString();
+    if (values.refreshTokenExpireAt) body.refreshTokenExpireAt = new Date(values.refreshTokenExpireAt).toISOString();
+    await api("/api/settings/qianchuan", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    message.success("千川 token 已写入");
+    qianchuanForm.resetFields();
+    await loadQianchuan();
+  }
+
+  async function bindAdvertiserToToken(values: {
+    tokenId: string;
+    advertiserId: string;
+    nickname?: string;
+    bindUserIds?: string[];
+  }) {
+    const body: Record<string, unknown> = {
+      tokenId: values.tokenId,
+      advertiserId: String(values.advertiserId).trim()
+    };
+    if (values.nickname) body.nickname = values.nickname;
+    if (values.bindUserIds && values.bindUserIds.length) body.bindUserIds = values.bindUserIds;
+    await api("/api/settings/qianchuan?action=bind", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    message.success("广告主已绑定");
+    bindAdvertiserForm.resetFields();
+    await loadQianchuan();
+  }
+
+  async function unbindAdvertiserFromToken(tokenId: string, advertiserId: string) {
+    modal.confirm({
+      title: "确认解绑该广告主？",
+      content: `解绑后用户「${advertiserId}」的实时数据查询会失败。token 本身不受影响。`,
+      okText: "解绑",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: async () => {
+        try {
+          await api("/api/settings/qianchuan?action=unbind", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tokenId, advertiserId })
+          });
+          message.success("已解绑");
+          await loadQianchuan();
+        } catch (error) {
+          message.error((error as Error).message);
+        }
+      }
+    });
+  }
+
+  async function downloadQianchuanTemplate() {
+    const r = await fetch("/api/settings/qianchuan/template", { credentials: "include" });
+    if (!r.ok) {
+      const t = await r.text();
+      message.error(t || "模板下载失败");
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "qianchuan-template.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+    message.success("模板已下载");
+  }
+
+  async function exportQianchuanExcel() {
+    const r = await fetch("/api/settings/qianchuan/export", { credentials: "include" });
+    if (!r.ok) {
+      const t = await r.text();
+      message.error(t || "导出失败");
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `qianchuan-anchor-list-${Date.now()}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+    message.success("已导出");
+  }
+
+  type QianchuanPreview = {
+    success: boolean;
+    anchorDiff: { add: QianchuanDiffRow[]; update: QianchuanDiffRow[]; delete: QianchuanDiffRow[] };
+    advertiserDiff: { add: QianchuanDiffRow[]; update: QianchuanDiffRow[]; delete: QianchuanDiffRow[] };
+    errors: Array<{ row: number; error: string }>;
+  };
+  const [importPreview, setImportPreview] = useState<{
+    file: File;
+    preview: QianchuanPreview;
+  } | null>(null);
+  const [importing, setImporting] = useState(false);
+
+  async function previewQianchuanImport(file: File) {
+    setImporting(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch("/api/settings/qianchuan/import/preview", {
+        method: "POST",
+        body: fd,
+        credentials: "include"
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        message.error(t || "预览失败");
+        return;
+      }
+      const preview = (await r.json()) as QianchuanPreview;
+      setImportPreview({ file, preview });
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function confirmQianchuanImport() {
+    if (!importPreview) return;
+    setImporting(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", importPreview.file);
+      const r = await fetch("/api/settings/qianchuan/import/apply", {
+        method: "POST",
+        body: fd,
+        credentials: "include"
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        message.error(t || "应用失败");
+        return;
+      }
+      const data = (await r.json()) as {
+        insertedAnchors: number;
+        updatedAnchors: number;
+        deletedAnchors: number;
+        insertedAdvertisers: number;
+        updatedAdvertisers: number;
+        deletedAdvertisers: number;
+        errors: Array<{ row: number; error: string }>;
+      };
+      const lines = [
+        `覆盖完成：anchor 新增 ${data.insertedAnchors} / 更新 ${data.updatedAnchors} / 删除 ${data.deletedAnchors}；advertiser 新增 ${data.insertedAdvertisers} / 更新 ${data.updatedAdvertisers} / 删除 ${data.deletedAdvertisers}`
+      ];
+      if (data.errors?.length) {
+        lines.push(`错误明细（前 5 条）：`);
+        for (const e of data.errors.slice(0, 5)) lines.push(`  第 ${e.row} 行：${e.error}`);
+        if (data.errors.length > 5) lines.push(`  ...共 ${data.errors.length} 条错误`);
+      }
+      message.success(lines.join("\n"), 6);
+      setImportPreview(null);
+      await loadQianchuan();
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function cancelQianchuanImport() {
+    setImportPreview(null);
+  }
+
+  async function refreshQianchuanToken(appId: string) {
+    const hide = message.loading("正在刷新 token...", 0);
+    try {
+      await api("/api/settings/qianchuan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ appId, action: "refresh" })
+      });
+      message.success("token 刷新成功");
+      await loadQianchuan();
+    } catch (error) {
+      message.error((error as Error).message);
+    } finally {
+      hide();
+    }
+  }
+
+  async function unbindQianchuanToken(appId: string) {
+    modal.confirm({
+      title: "确认删除整个 token？",
+      content: `删除后该 appId=${appId} 下所有广告主绑定都会被清除，用户实时数据查询会失败。`,
+      okText: "删除",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: async () => {
+        try {
+          await api("/api/settings/qianchuan", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ appId })
+          });
+          message.success("已删除");
+          await loadQianchuan();
+        } catch (error) {
+          message.error((error as Error).message);
+        }
+      }
+    });
+  }
 
   function changeUsagePeriod(nextPeriod: string) {
     setUsagePeriod(nextPeriod);
@@ -3014,6 +3495,7 @@ function SettingsView({ user }: { user: User }) {
           children: (
             <Card className="soft-card">
               <Form form={configForm} layout="vertical" onFinish={saveConfig}>
+                <ApiConfigCachePreview form={configForm} />
                 <Row gutter={16}>
                   <Col xs={24} md={12}>
                     <Form.Item name="textBaseUrl" label="文本 API Base URL">
@@ -3029,6 +3511,7 @@ function SettingsView({ user }: { user: User }) {
                     <Form.Item name="textWireApi" label="文本调用方式">
                       <Select
                         options={[
+                          { value: "anthropic", label: "Anthropic Messages（MiniMax M3 / Claude）" },
                           { value: "responses", label: "Responses API" },
                           { value: "chat", label: "Chat Completions" },
                           { value: "auto", label: "自动判断" }
@@ -3102,6 +3585,252 @@ function SettingsView({ user }: { user: User }) {
           key: "skills",
           label: "技能管理",
           children: <SkillAdminView user={user} />
+        },
+        {
+          key: "advertiserBindings",
+          label: "广告主绑定",
+          children: <AdvertiserBindingsPanel user={user} />
+        },
+        {
+          key: "qianchuan",
+          label: "千川接入",
+          children: (
+            <Space direction="vertical" size={16} style={{ width: "100%" }}>
+              <Card className="soft-card" title="绑定千川账号">
+                <Form
+                  form={qianchuanForm}
+                  layout="vertical"
+                  onFinish={bindQianchuanToken}
+                  initialValues={{}}
+                >
+                  <Row gutter={16}>
+                    <Col xs={24} md={12}>
+                      <Form.Item name="appId" label="App ID" rules={[{ required: true, message: "App ID 必填" }]}>
+                        <Input placeholder="千川开放平台 app_id" />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} md={12}>
+                      <Form.Item name="appSecret" label="App Secret" rules={[{ required: true, message: "App Secret 必填" }]}>
+                        <Input.Password placeholder="私密，不会回显到前端" />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                  <Row gutter={16}>
+                    <Col xs={24}>
+                      <Form.Item name="authCode" label="授权码（auth_code，可选；提供则自动兑换 token）" tooltip="从千川开放平台 OAuth 授权后回跳拿到；不填则手动填 access/refresh token">
+                        <Input placeholder="例如：70b080d0f9d810140bf7b283cc5e620601c837bd" />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                  <Typography.Text type="secondary">不填 authCode 时，手动填写 access/refresh token：</Typography.Text>
+                  <Row gutter={16}>
+                    <Col xs={24} md={12}>
+                      <Form.Item name="accessToken" label="Access Token">
+                        <Input.Password placeholder="首次注入的 access_token" />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} md={12}>
+                      <Form.Item name="refreshToken" label="Refresh Token">
+                        <Input.Password placeholder="首次注入的 refresh_token" />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} md={12}>
+                      <Form.Item name="accessTokenExpireAt" label="Access Token 过期时间">
+                        <Input type="datetime-local" />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} md={12}>
+                      <Form.Item name="refreshTokenExpireAt" label="Refresh Token 过期时间">
+                        <Input type="datetime-local" />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                  <Space>
+                    <Button type="primary" htmlType="submit">保存 token</Button>
+                    <Button onClick={() => qianchuanForm.resetFields()}>重置</Button>
+                  </Space>
+                </Form>
+              </Card>
+              <Card
+                className="soft-card"
+                title="抖音号名册（导入/导出）"
+                extra={
+                  <Space>
+                    <Button onClick={downloadQianchuanTemplate}>下载模板</Button>
+                    <Upload
+                      accept=".xlsx,.xls,.xlsm"
+                      showUploadList={false}
+                      beforeUpload={(file) => {
+                        previewQianchuanImport(file);
+                        return false;
+                      }}
+                    >
+                      <Button type="primary" loading={importing}>导入 Excel</Button>
+                    </Upload>
+                    <Button onClick={exportQianchuanExcel}>导出当前</Button>
+                  </Space>
+                }
+              >
+                <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+                  用于把「抖音号 ID ↔ 抖音号名称」批量录入。导入采用<strong>两段式确认</strong>：先选文件预览差异（新增 / 更新 / 删除），核对无误后再点确认才会真正覆盖系统数据。本操作仅超级管理员可执行。
+                </Typography.Paragraph>
+                <Typography.Text type="secondary">
+                  模板字段：advertiserId / anchorId / anchorName / nickname。Excel 必须先下载模板，填写后再导入；广告主 ID 必须已在系统中绑定，否则该行会在预览时报错。
+                </Typography.Text>
+              </Card>
+              <Modal
+                open={!!importPreview}
+                title="确认导入差异"
+                width={760}
+                onCancel={cancelQianchuanImport}
+                footer={[
+                  <Button key="cancel" onClick={cancelQianchuanImport} disabled={importing}>
+                    取消
+                  </Button>,
+                  <Button
+                    key="confirm"
+                    type="primary"
+                    danger
+                    loading={importing}
+                    disabled={
+                      importing ||
+                      !importPreview ||
+                      (importPreview.preview.anchorDiff.add.length +
+                        importPreview.preview.anchorDiff.update.length +
+                        importPreview.preview.anchorDiff.delete.length +
+                        importPreview.preview.advertiserDiff.add.length +
+                        importPreview.preview.advertiserDiff.update.length +
+                        importPreview.preview.advertiserDiff.delete.length ===
+                        0)
+                    }
+                    onClick={confirmQianchuanImport}
+                  >
+                    确认覆盖
+                  </Button>
+                ]}
+                destroyOnHidden
+              >
+                {importPreview ? (
+                  <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                    <Typography.Text type="secondary">
+                      即将对系统执行以下变更。未在 Excel 中出现且存在于系统的记录将被删除，请仔细核对。
+                    </Typography.Text>
+                    {importPreview.preview.errors.length > 0 && (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        message={`${importPreview.preview.errors.length} 行无法识别`}
+                        description={
+                          <ul style={{ marginBottom: 0, paddingLeft: 18 }}>
+                            {importPreview.preview.errors.slice(0, 10).map((e, i) => (
+                              <li key={i}>第 {e.row} 行：{e.error}</li>
+                            ))}
+                            {importPreview.preview.errors.length > 10 && (
+                              <li>...共 {importPreview.preview.errors.length} 条</li>
+                            )}
+                          </ul>
+                        }
+                      />
+                    )}
+                    <DiffSection title="抖音号名册（anchor）" diff={importPreview.preview.anchorDiff} kind="anchor" />
+                    <DiffSection title="广告主绑定（advertiser）" diff={importPreview.preview.advertiserDiff} kind="advertiser" />
+                  </Space>
+                ) : null}
+              </Modal>
+              <Card className="soft-card" title="已绑定账号">
+                {qianchuanTokens.length === 0 ? (
+                  <Typography.Text type="secondary">尚未绑定任何千川账号</Typography.Text>
+                ) : (
+                  <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                    {qianchuanTokens.map((row) => (
+                      <Card key={row.id} type="inner" title={`App ${row.appId}`}>
+                        <Row gutter={[16, 8]}>
+                          <Col xs={24} md={8}>
+                            <Typography.Text type="secondary">Access Token：</Typography.Text>
+                            <Tooltip title={row.lastError || "无错误"}>
+                              <Tag color={row.accessTokenStatus === "valid" ? "green" : "red"} style={{ marginLeft: 4 }}>
+                                {row.accessTokenStatus === "valid" ? "有效" : "已过期"}
+                              </Tag>
+                            </Tooltip>
+                            <Typography.Text type="secondary" style={{ marginLeft: 8 }}>{row.accessTokenMasked || "-"}</Typography.Text>
+                          </Col>
+                          <Col xs={24} md={8}>
+                            <Typography.Text type="secondary">Refresh Token：</Typography.Text>
+                            <Tag color={row.refreshTokenStatus === "valid" ? "green" : "red"} style={{ marginLeft: 4 }}>
+                              {row.refreshTokenStatus === "valid" ? "有效" : "已过期"}
+                            </Tag>
+                          </Col>
+                          <Col xs={24} md={8}>
+                            <Typography.Text type="secondary">最近刷新：</Typography.Text>
+                            {row.lastRefreshAt ? formatDateTime(row.lastRefreshAt) : <Typography.Text type="secondary">未刷新</Typography.Text>}
+                          </Col>
+                          <Col xs={24} md={12}>
+                            <Typography.Text type="secondary">access 过期：{formatDateTime(row.accessTokenExpireAt)}</Typography.Text>
+                          </Col>
+                          <Col xs={24} md={12}>
+                            <Typography.Text type="secondary">refresh 过期：{formatDateTime(row.refreshTokenExpireAt)}</Typography.Text>
+                          </Col>
+                          <Col xs={24}>
+                            <Space>
+                              <Button size="small" onClick={() => refreshQianchuanToken(row.appId)}>刷新 token</Button>
+                              <Button size="small" danger onClick={() => unbindQianchuanToken(row.appId)}>删除 token</Button>
+                            </Space>
+                          </Col>
+                        </Row>
+                        <Divider style={{ margin: "12px 0" }} />
+                        <Typography.Text strong>已绑定广告主</Typography.Text>
+                        {row.advertisers.length === 0 ? (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>暂未绑定广告主</Typography.Text>
+                        ) : (
+                          <Space wrap style={{ marginTop: 8 }}>
+                            {row.advertisers.map((adv) => (
+                              <Tag
+                                key={adv.id}
+                                closable
+                                onClose={(e) => {
+                                  e.preventDefault();
+                                  unbindAdvertiserFromToken(row.id, adv.advertiserId);
+                                }}
+                              >
+                                {adv.advertiserId}{adv.nickname ? `（${adv.nickname}）` : ""}
+                              </Tag>
+                            ))}
+                          </Space>
+                        )}
+                        <Form
+                          form={bindAdvertiserForm}
+                          layout="inline"
+                          style={{ marginTop: 12 }}
+                          onFinish={(values: { advertiserId: string; nickname?: string; bindUserIds?: string[] }) =>
+                            bindAdvertiserToToken({ tokenId: row.id, ...values })
+                          }
+                        >
+                          <Form.Item name="advertiserId" rules={[{ required: true, message: "广告主 ID 必填" }]}>
+                            <Input placeholder="新广告主 ID" style={{ width: 200 }} />
+                          </Form.Item>
+                          <Form.Item name="nickname">
+                            <Input placeholder="备注（可选）" style={{ width: 160 }} />
+                          </Form.Item>
+                          <Form.Item name="bindUserIds">
+                            <Select
+                              mode="multiple"
+                              allowClear
+                              placeholder="同时绑定到以下用户"
+                              style={{ minWidth: 220 }}
+                              options={users.map((u) => ({ value: u.id, label: `${u.nickname}（${u.username}）` }))}
+                            />
+                          </Form.Item>
+                          <Form.Item>
+                            <Button type="primary" htmlType="submit" size="small">添加广告主</Button>
+                          </Form.Item>
+                        </Form>
+                      </Card>
+                    ))}
+                  </Space>
+                )}
+              </Card>
+            </Space>
+          )
         },
         {
           key: "users",
@@ -3293,8 +4022,46 @@ function SettingsView({ user }: { user: User }) {
                         <Statistic title="对话次数" value={usageRows.reduce((sum, row) => sum + row.chatCount, 0)} suffix="次" />
                         <Statistic title="对话消耗金额" value={usageRows.reduce((sum, row) => sum + row.chatEstimatedCost, 0)} prefix="¥" precision={4} />
                         <Statistic title="缓存命中 Token" value={usageRows.reduce((sum, row) => sum + row.chatCachedTokens, 0)} />
+                        <Statistic title="缓存节省金额" value={cacheStats?.totals.savedCost ?? 0} prefix="¥" precision={4} />
+                        <Statistic title="缓存命中率" value={cacheStats ? cacheStats.totals.cacheHitRate : 0} suffix={cacheStats ? "" : ""} precision={2} formatter={(v) => `${((Number(v) || 0) * 100).toFixed(1)}%`} />
                         <Statistic title="总估算消耗" value={usageRows.reduce((sum, row) => sum + row.totalEstimatedCost, 0)} prefix="¥" precision={4} />
                       </Space>
+                      {cacheStats?.alert ? (
+                        <Alert
+                          type={cacheStats.alert.level === "critical" ? "error" : "warning"}
+                          showIcon
+                          message={`Prompt Cache 命中率异常（${cacheStats.alert.level === "critical" ? "严重" : "警告"}）`}
+                          description={cacheStats.alert.message}
+                        />
+                      ) : null}
+                      {cacheStats && cacheStats.daily.some((day) => day.promptTokens > 0) ? (
+                        <Card size="small" title="缓存命中趋势（最近 30 天）" className="soft-card">
+                          <ResponsiveContainer width="100%" height={220}>
+                            <ComposedChart data={cacheStats.daily.map((day) => ({ ...day, hitRatePct: Number((day.cacheHitRate * 100).toFixed(2)) }))}>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis dataKey="date" tickFormatter={(value: string) => value.slice(5)} fontSize={11} />
+                              <YAxis yAxisId="left" tickFormatter={(value: number) => `${value}%`} fontSize={11} />
+                              <YAxis yAxisId="right" orientation="right" tickFormatter={(value: number) => `¥${value.toFixed(2)}`} fontSize={11} />
+                              <RechartsTooltip
+                                formatter={(value, name) => {
+                                  if (name === "命中率(%)") return [`${value}%`, String(name)];
+                                  if (name === "节省金额(¥)") return [`¥${Number(value).toFixed(4)}`, String(name)];
+                                  return [value as React.ReactNode, String(name)];
+                                }}
+                              />
+                              <Legend />
+                              <Bar yAxisId="right" dataKey="savedCost" name="节省金额(¥)" fill="#52c41a" />
+                              <Line yAxisId="left" type="monotone" dataKey="hitRatePct" name="命中率(%)" stroke="#1677ff" strokeWidth={2} dot={false} />
+                            </ComposedChart>
+                          </ResponsiveContainer>
+                          {cacheStats.byKey.length > 0 ? (
+                            <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+                              按 cacheKey 分桶：
+                              {cacheStats.byKey.map((k) => `${k.cacheKey} → ${k.promptTokens.toLocaleString()} tokens / 命中率 ${(k.cacheHitRate * 100).toFixed(1)}%`).join("；")}
+                            </Typography.Paragraph>
+                          ) : null}
+                        </Card>
+                      ) : null}
                       <Table
                         rowKey="id"
                         size="small"
@@ -3451,6 +4218,85 @@ function statusLabel(status: string) {
 
 function statusColor(status: string) {
   return { queued: "blue", generating: "gold", completed: "green", failed: "red", canceled: "default" }[status] || "default";
+}
+
+type QianchuanDiffRow = {
+  row?: number;
+  advertiserId: string;
+  anchorId?: string;
+  anchorName?: string;
+  nickname?: string | null;
+  tokenAppId?: string;
+  before?: Record<string, unknown>;
+};
+
+type DiffSectionProps = {
+  title: string;
+  diff: { add: QianchuanDiffRow[]; update: QianchuanDiffRow[]; delete: QianchuanDiffRow[] };
+  kind: "anchor" | "advertiser";
+};
+function rowKeyOf(r: QianchuanDiffRow): string {
+  return r.anchorId
+    ? `${r.advertiserId}::${r.anchorId}`
+    : `${r.advertiserId}::${r.tokenAppId ?? ""}`;
+}
+function DiffSection({ title, diff, kind }: DiffSectionProps) {
+  const total = diff.add.length + diff.update.length + diff.delete.length;
+  if (total === 0) {
+    return (
+      <Card size="small" type="inner" title={title}>
+        <Typography.Text type="secondary">无变更</Typography.Text>
+      </Card>
+    );
+  }
+  const columns = kind === "anchor"
+    ? [
+        { title: "advertiserId", dataIndex: "advertiserId" },
+        { title: "anchorId", dataIndex: "anchorId" },
+        { title: "anchorName", dataIndex: "anchorName" },
+        { title: "nickname", dataIndex: "nickname" }
+      ]
+    : [
+        { title: "advertiserId", dataIndex: "advertiserId" },
+        { title: "tokenAppId", dataIndex: "tokenAppId" },
+        { title: "nickname", dataIndex: "nickname" }
+      ];
+  return (
+    <Card size="small" type="inner" title={`${title}（新增 ${diff.add.length} · 更新 ${diff.update.length} · 删除 ${diff.delete.length}）`}>
+      {diff.add.length > 0 && (
+        <>
+          <Typography.Text strong style={{ color: "#389e0d" }}>新增</Typography.Text>
+          <Table size="small" pagination={false} rowKey={rowKeyOf} dataSource={diff.add} columns={columns} />
+        </>
+      )}
+      {diff.update.length > 0 && (
+        <>
+          <Typography.Text strong style={{ color: "#d48806", marginTop: 8, display: "inline-block" }}>更新</Typography.Text>
+          <Table
+            size="small"
+            pagination={false}
+            rowKey={rowKeyOf}
+            dataSource={diff.update}
+            columns={[
+              ...columns,
+              {
+                title: "变更前",
+                dataIndex: "before",
+                render: (b: Record<string, unknown> | undefined) =>
+                  b ? Object.entries(b).map(([k, v]) => `${k}=${v ?? "空"}`).join("；") : "—"
+              }
+            ]}
+          />
+        </>
+      )}
+      {diff.delete.length > 0 && (
+        <>
+          <Typography.Text strong type="danger" style={{ marginTop: 8, display: "inline-block" }}>删除（系统中将不再保留）</Typography.Text>
+          <Table size="small" pagination={false} rowKey={rowKeyOf} dataSource={diff.delete} columns={columns} />
+        </>
+      )}
+    </Card>
+  );
 }
 
 function formatDateTime(value?: string) {
@@ -3778,6 +4624,183 @@ function DepartmentAdminView({ user }: { user: User }) {
   );
 }
 
+function AdvertiserBindingsPanel({ user }: { user: User }) {
+  const { message, modal } = App.useApp();
+  const canManage = user.role === "admin" || !!user.permissions?.includes("manage_settings");
+  const [users, setUsers] = useState<
+    Array<{ id: string; username: string; nickname: string; advertiserId: string | null }>
+  >([]);
+  const [selectedUserId, setSelectedUserId] = useState<string>(user.id);
+  const [bindings, setBindings] = useState<AdvertiserBinding[]>([]);
+  const [newAdvertiserId, setNewAdvertiserId] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function refreshUsers() {
+    if (!canManage) return;
+    const r = await api<{ users: Array<{ id: string; username: string; nickname: string; advertiserId: string | null }> }>(
+      "/api/users"
+    );
+    setUsers(r.users || []);
+  }
+
+  async function refreshBindings(uid: string) {
+    if (!uid) {
+      setBindings([]);
+      return;
+    }
+    setLoading(true);
+    try {
+      const r = await api<{ bindings: AdvertiserBinding[] }>(
+        `/api/admin/bindings?userId=${encodeURIComponent(uid)}`
+      );
+      setBindings(r.bindings || []);
+    } catch (e) {
+      message.error((e as Error).message || "加载失败");
+      setBindings([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (canManage) refreshUsers();
+  }, [canManage]);
+
+  useEffect(() => {
+    refreshBindings(selectedUserId);
+  }, [selectedUserId]);
+
+  async function addBinding() {
+    if (!newAdvertiserId.trim()) {
+      message.warning("请输入广告主 ID");
+      return;
+    }
+    try {
+      await api("/api/admin/bindings", {
+        method: "POST",
+        body: JSON.stringify({
+          userId: selectedUserId,
+          advertiserId: newAdvertiserId.trim(),
+          isPrimary: bindings.length === 0
+        })
+      });
+      setNewAdvertiserId("");
+      await refreshBindings(selectedUserId);
+      message.success("已添加绑定");
+    } catch (e) {
+      message.error((e as Error).message || "添加失败");
+    }
+  }
+
+  async function setPrimary(advertiserId: string) {
+    try {
+      await api("/api/admin/bindings", {
+        method: "POST",
+        body: JSON.stringify({ userId: selectedUserId, advertiserId, isPrimary: true })
+      });
+      await refreshBindings(selectedUserId);
+      message.success(`已将 ${advertiserId} 设为主绑定`);
+    } catch (e) {
+      message.error((e as Error).message || "操作失败");
+    }
+  }
+
+  async function removeBinding(advertiserId: string) {
+    modal.confirm({
+      title: `确认解绑 ${advertiserId}？`,
+      content: "解绑后该用户无法用此广告主查询千川数据。",
+      onOk: async () => {
+        try {
+          await api("/api/admin/bindings", {
+            method: "DELETE",
+            body: JSON.stringify({ userId: selectedUserId, advertiserId })
+          });
+          await refreshBindings(selectedUserId);
+          message.success("已解绑");
+        } catch (e) {
+          message.error((e as Error).message || "解绑失败");
+        }
+      }
+    });
+  }
+
+  return (
+    <Card className="soft-card" title="广告主绑定（user ↔ advertiser）">
+      {canManage ? (
+        <Space direction="vertical" size={16} style={{ width: "100%" }}>
+          <Space wrap>
+            <span>选择用户：</span>
+            <Select
+              style={{ minWidth: 240 }}
+              value={selectedUserId}
+              onChange={setSelectedUserId}
+              options={users.map((u) => ({ value: u.id, label: `${u.nickname}（${u.username}）` }))}
+            />
+          </Space>
+          <Table<AdvertiserBinding>
+            rowKey={(r) => r.advertiserId}
+            loading={loading}
+            dataSource={bindings}
+            pagination={false}
+            columns={[
+              { title: "广告主 ID", dataIndex: "advertiserId" },
+              {
+                title: "是否主绑定",
+                dataIndex: "isPrimary",
+                render: (v: boolean) => (v ? <Tag color="green">是</Tag> : <Tag>否</Tag>)
+              },
+              {
+                title: "操作",
+                render: (_: unknown, r: AdvertiserBinding) => (
+                  <Space>
+                    <Button
+                      size="small"
+                      disabled={r.isPrimary}
+                      onClick={() => setPrimary(r.advertiserId)}
+                    >
+                      设为主
+                    </Button>
+                    <Button
+                      size="small"
+                      danger
+                      disabled={r.isPrimary}
+                      onClick={() => removeBinding(r.advertiserId)}
+                    >
+                      解绑
+                    </Button>
+                  </Space>
+                )
+              }
+            ]}
+          />
+          <Space wrap>
+            <Input
+              placeholder="新广告主 ID"
+              style={{ width: 280 }}
+              value={newAdvertiserId}
+              onChange={(e) => setNewAdvertiserId(e.target.value)}
+            />
+            <Button type="primary" onClick={addBinding}>
+              添加绑定
+            </Button>
+          </Space>
+          <Alert
+            type="info"
+            showIcon
+            message="说明：每个用户可绑定多个广告主 ID；主绑定决定登录后的默认当前广告主，可在顶部下拉切换。"
+          />
+        </Space>
+      ) : (
+        <Alert
+          type="warning"
+          showIcon
+          message="仅管理员可管理用户广告主绑定。"
+        />
+      )}
+    </Card>
+  );
+}
+
 function SkillAdminView({ user }: { user: User }) {
   const isAdminUser = user.role === "admin";
   const canManage = isAdminUser || !!user.permissions?.includes("manage_settings");
@@ -3853,28 +4876,8 @@ function SkillAdminView({ user }: { user: User }) {
     }
   }
 
-  function openCreate() {
-    setEditingSkill(null);
-    setModalOpen(true);
-    setTestArgs("{}");
-    setTestResult(null);
-    const initialParams = [{ uid: `row-${Date.now()}`, name: "query", description: "用户提问或关键词", required: true }];
-    setParamRows(initialParams);
-    skillForm.resetFields();
-    skillForm.setFieldsValue({
-      name: "",
-      displayName: "",
-      description: "",
-      executeMode: "search_kb",
-      enabled: true,
-      departmentId: user.departmentId || undefined,
-      queryParam: "query",
-      limitParam: undefined,
-      assetTypeParam: undefined,
-      assetIdParam: undefined,
-      template: "",
-      systemPrompt: ""
-    });
+  function openCreateWarning() {
+    message.info("新建技能请到聊天对话中对 AI 说『帮我创建一个新技能: ...』,或粘贴 JSON 让 AI 解析后调用 skillCreator 技能。");
   }
 
   function openEdit(row: SkillRow) {
@@ -4016,16 +5019,12 @@ function SkillAdminView({ user }: { user: User }) {
         body: JSON.stringify(payload)
       });
       message.success("技能已更新");
-    } else {
-      await api("/api/skills", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      message.success("技能已创建");
+      closeModal();
+      load();
+      return;
     }
-    closeModal();
-    load();
+    // 防御性分支: 手动创建入口已关闭, UI 不应让用户走到这里
+    message.warning("手动创建入口已关闭,请通过对话中的 skillCreator 创建");
   }
 
   async function runTest() {
@@ -4089,16 +5088,33 @@ function SkillAdminView({ user }: { user: User }) {
 
   return (
     <Space direction="vertical" size={18} style={{ width: "100%" }}>
+      <Alert
+        type="info"
+        showIcon
+        message="技能创建入口已迁移至对话"
+        description={
+          <Space direction="vertical" size={4} style={{ width: "100%" }}>
+            <span>
+              在聊天窗口对 AI 说『帮我创建一个新技能: [需求]』(例如「做一个产品白底图检索的技能,参数 query,模式 search_kb, 配置 queryParam 映射到 query」)。
+              AI 会调用 <Typography.Text code>skillCreator</Typography.Text> 自动写入数据库。
+            </span>
+            <span>
+              也可以把现有 JSON 配置直接粘贴给 AI,它会解析后调用 <Typography.Text code>skillCreator</Typography.Text> 写入。
+            </span>
+            <Typography.Text type="secondary">
+              仅显示本部门或可见的技能;内置技能不可编辑;查看 / 编辑 / 删除 入口保留。
+            </Typography.Text>
+          </Space>
+        }
+        action={
+          <Button size="small" type="link" onClick={openCreateWarning}>查看示例</Button>
+        }
+      />
       <Card
         className="soft-card"
         title="技能列表"
         extra={
-          <Space>
-            <Typography.Text type="secondary">仅显示本部门或可见的技能；内置技能不可编辑。</Typography.Text>
-            <Button type="primary" onClick={openCreate}>
-              新建技能
-            </Button>
-          </Space>
+          <Typography.Text type="secondary">仅显示本部门或可见的技能;内置技能不可编辑。</Typography.Text>
         }
       >
         <Table
@@ -4127,7 +5143,7 @@ function SkillAdminView({ user }: { user: User }) {
       </Card>
       <Modal
         open={modalOpen}
-        title={editingSkill ? `编辑技能：${editingSkill.displayName}` : "新建技能"}
+        title={editingSkill ? `编辑技能：${editingSkill.displayName}` : "编辑技能"}
         width={720}
         destroyOnHidden
         onCancel={closeModal}

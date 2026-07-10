@@ -36,7 +36,7 @@ export type SkillResult = {
 };
 
 export type SkillContext = {
-  user: Pick<User, "id" | "role" | "departmentId">;
+  user: Pick<User, "id" | "role" | "departmentId" | "advertiserId">;
 };
 
 export type Skill = {

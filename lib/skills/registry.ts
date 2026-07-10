@@ -1,13 +1,21 @@
 import { prisma } from "../prisma";
 import { getAssetDetailSkill } from "./asset-detail";
 import { searchKnowledgeBaseSkill } from "./knowledge-base";
+import { qianchuanAccountSkill } from "./qianchuan-account";
+import { qianchuanMaterialSkill } from "./qianchuan-material";
+import { qianchuanMaterialDetailSkill } from "./qianchuan-material-detail";
+import { skillCreatorSkill } from "./skill-creator";
 import type { Skill, SkillDefinition } from "./types";
 import { toOpenAITool } from "./types";
 import { buildUserSkill } from "./user-skill";
 
 const BUILTIN: Record<string, Skill> = {
   [searchKnowledgeBaseSkill.definition.name]: searchKnowledgeBaseSkill,
-  [getAssetDetailSkill.definition.name]: getAssetDetailSkill
+  [getAssetDetailSkill.definition.name]: getAssetDetailSkill,
+  [qianchuanAccountSkill.definition.name]: qianchuanAccountSkill,
+  [qianchuanMaterialSkill.definition.name]: qianchuanMaterialSkill,
+  [qianchuanMaterialDetailSkill.definition.name]: qianchuanMaterialDetailSkill,
+  [skillCreatorSkill.definition.name]: skillCreatorSkill
 };
 
 const BUILTIN_NAMES = new Set(Object.keys(BUILTIN));

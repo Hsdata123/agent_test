@@ -10,3 +10,11 @@ storage/uploads/*
 storage/results/*
 !storage/uploads/.gitkeep
 !storage/results/.gitkeep
+skill_sandbox/*
+!skill_sandbox/.gitkeep
+
+# 临时调试 / 跑测产物
+_tmp/
+tempTestFile/
+scripts/__pycache__/
+test/fixtures/

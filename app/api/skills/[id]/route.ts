@@ -3,8 +3,7 @@ import { jsonError, requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { canManageScene, getEffectiveDepartmentId, isAdmin } from "@/lib/dept-scope";
 import { invalidateSkillCache, getBuiltinSkillNames } from "@/lib/skills/registry";
-
-const VALID_MODES = new Set(["search_kb", "get_detail", "no_op"]);
+import { validateConfigForMode, validateParametersSchema } from "@/lib/skills/management";
 
 export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) {
   try {
@@ -74,6 +73,11 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
     }
     if (body.departmentId !== undefined) {
       const departmentId = String(body.departmentId);
+      // 防御: departmentId 必须存在,否则 Prisma 抛 FK 违反转 500
+      const dept = await prisma.department.findUnique({ where: { id: departmentId }, select: { id: true } });
+      if (!dept) {
+        throw Object.assign(new Error(`部门 ${departmentId} 不存在,无法移动技能`), { status: 400 });
+      }
       if (!(await canManageScene(user, departmentId))) {
         throw Object.assign(new Error("无权限移动到该部门"), { status: 403 });
       }
@@ -86,12 +90,10 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
     }
     if (body.executeMode !== undefined || body.executeConfig !== undefined) {
       const executeMode = body.executeMode !== undefined ? String(body.executeMode) : existing.executeMode;
-      if (!VALID_MODES.has(executeMode)) {
-        throw Object.assign(new Error(`不支持的 executeMode: ${executeMode}`), { status: 400 });
-      }
       const executeConfig = body.executeConfig !== undefined
         ? parseJson(String(body.executeConfig), "executeConfig")
         : JSON.parse(existing.executeConfig);
+      // validateConfigForMode 内部已校验 mode ∈ {search_kb, get_detail, no_op, exec_function}
       validateConfigForMode(executeMode, executeConfig);
       data.executeMode = executeMode;
       data.executeConfig = JSON.stringify(executeConfig);
@@ -131,41 +133,5 @@ function parseJson(raw: string, field: string): unknown {
     return JSON.parse(raw);
   } catch {
     throw Object.assign(new Error(`${field} 不是合法 JSON`), { status: 400 });
-  }
-}
-
-function validateParametersSchema(value: unknown) {
-  if (!value || typeof value !== "object") {
-    throw Object.assign(new Error("parameters 必须是对象"), { status: 400 });
-  }
-  const obj = value as { type?: string; properties?: Record<string, unknown>; required?: unknown };
-  if (obj.type !== "object") {
-    throw Object.assign(new Error('parameters.type 必须为 "object"'), { status: 400 });
-  }
-  if (obj.properties && typeof obj.properties !== "object") {
-    throw Object.assign(new Error("parameters.properties 必须为对象"), { status: 400 });
-  }
-  if (obj.required && !Array.isArray(obj.required)) {
-    throw Object.assign(new Error("parameters.required 必须为字符串数组"), { status: 400 });
-  }
-}
-
-function validateConfigForMode(mode: string, config: unknown) {
-  if (!config || typeof config !== "object") {
-    throw Object.assign(new Error("executeConfig 必须是对象"), { status: 400 });
-  }
-  const cfg = config as Record<string, unknown>;
-  if (mode === "search_kb") {
-    if (typeof cfg.queryParam !== "string" || cfg.queryParam.length === 0) {
-      throw Object.assign(new Error("search_kb 模式需要 queryParam"), { status: 400 });
-    }
-  } else if (mode === "get_detail") {
-    if (typeof cfg.assetIdParam !== "string" || cfg.assetIdParam.length === 0) {
-      throw Object.assign(new Error("get_detail 模式需要 assetIdParam"), { status: 400 });
-    }
-  } else if (mode === "no_op") {
-    if (typeof cfg.template !== "string") {
-      throw Object.assign(new Error("no_op 模式需要 template"), { status: 400 });
-    }
   }
 }
