@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS Session (
   CONSTRAINT Session_userId_fkey FOREIGN KEY (userId) REFERENCES User (id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS UserAdvertiserBinding (
+  id TEXT PRIMARY KEY NOT NULL,
+  userId TEXT NOT NULL,
+  advertiserId TEXT NOT NULL,
+  isPrimary INTEGER NOT NULL DEFAULT 0,
+  createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT UserAdvertiserBinding_userId_fkey FOREIGN KEY (userId) REFERENCES User (id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS UserAdvertiserBinding_userId_advertiserId_key ON UserAdvertiserBinding(userId, advertiserId);
+CREATE INDEX IF NOT EXISTS UserAdvertiserBinding_userId_idx ON UserAdvertiserBinding(userId);
+CREATE INDEX IF NOT EXISTS UserAdvertiserBinding_advertiserId_idx ON UserAdvertiserBinding(advertiserId);
+
 CREATE TABLE IF NOT EXISTS Project (
   id TEXT PRIMARY KEY NOT NULL,
   name TEXT NOT NULL,
@@ -149,9 +161,9 @@ CREATE TABLE IF NOT EXISTS GenerationResult (
 
 CREATE TABLE IF NOT EXISTS ApiConfig (
   id TEXT PRIMARY KEY NOT NULL DEFAULT 'singleton',
-  textBaseUrl TEXT NOT NULL DEFAULT 'https://token.ithinkai.cn/v1',
-  textModel TEXT NOT NULL DEFAULT 'gpt-5.5-token',
-  textWireApi TEXT NOT NULL DEFAULT 'responses',
+  textBaseUrl TEXT NOT NULL DEFAULT 'https://api.minimaxi.com/anthropic',
+  textModel TEXT NOT NULL DEFAULT 'MiniMax-M3',
+  textWireApi TEXT NOT NULL DEFAULT 'anthropic',
   textPromptCacheEnabled BOOLEAN NOT NULL DEFAULT 1,
   textPromptCacheRetention TEXT NOT NULL DEFAULT '24h',
   textPromptCacheKey TEXT NOT NULL DEFAULT 'commerce-chat',
@@ -172,6 +184,7 @@ CREATE TABLE IF NOT EXISTS ChatUsage (
   completionTokens INTEGER NOT NULL DEFAULT 0,
   totalTokens INTEGER NOT NULL DEFAULT 0,
   cachedTokens INTEGER NOT NULL DEFAULT 0,
+  cacheKey TEXT,
   estimatedCost REAL NOT NULL DEFAULT 0,
   createdAt DATETIME NOT NULL,
   CONSTRAINT ChatUsage_userId_fkey FOREIGN KEY (userId) REFERENCES User (id) ON DELETE CASCADE ON UPDATE CASCADE
@@ -265,9 +278,76 @@ ensureColumn("ApiConfig", "textPromptCacheRetention", "TEXT NOT NULL DEFAULT '24
 ensureColumn("ApiConfig", "textPromptCacheKey", "TEXT NOT NULL DEFAULT 'commerce-chat'");
 ensureColumn("ApiConfig", "disableResponseStorage", "BOOLEAN NOT NULL DEFAULT 1");
 ensureColumn("ChatUsage", "cachedTokens", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("ChatUsage", "cacheKey", "TEXT");
 ensureColumn("User", "departmentId", "TEXT");
+ensureColumn("User", "advertiserId", "TEXT");
 ensureColumn("KnowledgeAsset", "departmentId", "TEXT");
 ensureColumn("KnowledgeAsset", "scenes", "TEXT NOT NULL DEFAULT '[]'");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS QianchuanToken (
+    id TEXT PRIMARY KEY NOT NULL,
+    appId TEXT NOT NULL UNIQUE,
+    appSecret TEXT NOT NULL,
+    accessToken TEXT NOT NULL,
+    refreshToken TEXT NOT NULL,
+    accessTokenExpireAt DATETIME NOT NULL,
+    refreshTokenExpireAt DATETIME NOT NULL,
+    scope TEXT,
+    lastRefreshAt DATETIME,
+    lastError TEXT,
+    createdAt DATETIME NOT NULL,
+    updatedAt DATETIME NOT NULL
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS QianchuanAdvertiser (
+    id TEXT PRIMARY KEY NOT NULL,
+    tokenId TEXT NOT NULL,
+    advertiserId TEXT NOT NULL,
+    nickname TEXT,
+    createdAt DATETIME NOT NULL,
+    CONSTRAINT QianchuanAdvertiser_tokenId_fkey FOREIGN KEY (tokenId) REFERENCES QianchuanToken (id) ON DELETE CASCADE ON UPDATE CASCADE
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS QianchuanAdvertiser_tokenId_advertiserId_key ON QianchuanAdvertiser(tokenId, advertiserId);
+  CREATE INDEX IF NOT EXISTS QianchuanAdvertiser_advertiserId_idx ON QianchuanAdvertiser(advertiserId);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS QianchuanAnchor (
+    id TEXT PRIMARY KEY NOT NULL,
+    advertiserId TEXT NOT NULL,
+    anchorId TEXT NOT NULL,
+    anchorName TEXT NOT NULL,
+    nickname TEXT,
+    lastSeenAt DATETIME NOT NULL,
+    createdAt DATETIME NOT NULL,
+    updatedAt DATETIME NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS QianchuanAnchor_advertiserId_anchorId_key ON QianchuanAnchor(advertiserId, anchorId);
+  CREATE INDEX IF NOT EXISTS QianchuanAnchor_advertiserId_anchorName_idx ON QianchuanAnchor(advertiserId, anchorName);
+`);
+
+const hasNicknameCol = db.prepare("PRAGMA table_info(QianchuanAnchor)").all().some((c) => c.name === "nickname");
+if (!hasNicknameCol) {
+  db.exec("ALTER TABLE QianchuanAnchor ADD COLUMN nickname TEXT");
+}
+
+const hasAdvertiserIdCol = db.prepare("PRAGMA table_info(QianchuanToken)").all().some((c) => c.name === "advertiserId");
+if (hasAdvertiserIdCol) {
+  const oldRows = db.prepare("SELECT id, advertiserId FROM QianchuanToken WHERE advertiserId IS NOT NULL AND advertiserId != ''").all();
+  const now = new Date().toISOString();
+  const insertBind = db.prepare(
+    "INSERT OR IGNORE INTO QianchuanAdvertiser (id, tokenId, advertiserId, createdAt) VALUES (?, ?, ?, ?)"
+  );
+  for (const row of oldRows) {
+    insertBind.run(`bind_${row.id}`, row.id, row.advertiserId, now);
+  }
+  db.exec("DROP INDEX IF EXISTS QianchuanToken_advertiserId_idx");
+  db.exec("ALTER TABLE QianchuanToken DROP COLUMN advertiserId");
+  db.exec("CREATE INDEX IF NOT EXISTS QianchuanAdvertiser_advertiserId_idx ON QianchuanAdvertiser(advertiserId)");
+}
 
 const defaultDeptRow = db.prepare("SELECT id FROM Department WHERE id = ?").get("dept_default");
 if (!defaultDeptRow) {

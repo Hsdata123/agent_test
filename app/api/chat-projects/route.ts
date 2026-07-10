@@ -18,9 +18,9 @@ export async function GET() {
       user.id
     );
     const conversations = await prisma.$queryRawUnsafe<
-      Array<{ id: string; projectId: string; title: string; createdAt: string; updatedAt: string }>
+      Array<{ id: string; projectId: string; title: string; prefsJson: string | null; createdAt: string; updatedAt: string }>
     >(
-      `SELECT c.id, c.projectId, c.title, c.createdAt, c.updatedAt
+      `SELECT c.id, c.projectId, c.title, c.prefsJson, c.createdAt, c.updatedAt
        FROM ChatConversation c
        JOIN ChatProject p ON p.id = c.projectId
        WHERE p.createdById = ?
@@ -49,6 +49,7 @@ export async function POST(request: Request) {
     const now = new Date().toISOString();
     const id = randomUUID();
     const conversationId = randomUUID();
+    const defaultPrefs = JSON.stringify({ useKnowledge: false, useQianchuan: true });
     await prisma.$executeRawUnsafe(
       `INSERT INTO ChatProject (id, name, createdById, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)`,
       id,
@@ -58,10 +59,11 @@ export async function POST(request: Request) {
       now
     );
     await prisma.$executeRawUnsafe(
-      `INSERT INTO ChatConversation (id, projectId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO ChatConversation (id, projectId, title, prefsJson, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
       conversationId,
       id,
       "新对话",
+      defaultPrefs,
       now,
       now
     );
@@ -73,7 +75,7 @@ export async function POST(request: Request) {
         createdById: user.id,
         createdAt: now,
         updatedAt: now,
-        conversations: [{ id: conversationId, projectId: id, title: "新对话", createdAt: now, updatedAt: now }]
+        conversations: [{ id: conversationId, projectId: id, title: "新对话", prefsJson: defaultPrefs, createdAt: now, updatedAt: now }]
       }
     });
   } catch (error) {

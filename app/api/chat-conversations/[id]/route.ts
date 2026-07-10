@@ -11,7 +11,7 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     const conversation = await getChatConversationForUser(id, user.id);
     if (!conversation) throw Object.assign(new Error("对话不存在或无权限访问"), { status: 404 });
     const messages = await prisma.$queryRawUnsafe<ChatMessageRow[]>(
-      `SELECT id, conversationId, role, content, createdAt
+      `SELECT id, conversationId, role, content, createdAt, processLog, finalDebug, finalAssets
        FROM ChatMessage
        WHERE conversationId = ?
        ORDER BY createdAt ASC`,

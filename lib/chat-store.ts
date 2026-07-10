@@ -14,6 +14,7 @@ export type ChatConversationRow = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  prefsJson?: string | null;
 };
 
 export type ChatMessageRow = {
@@ -22,6 +23,9 @@ export type ChatMessageRow = {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  processLog?: string | null;
+  finalDebug?: string | null;
+  finalAssets?: string | null;
 };
 
 export async function ensureChatWorkspaceTables() {
@@ -40,6 +44,7 @@ export async function ensureChatWorkspaceTables() {
       id TEXT PRIMARY KEY NOT NULL,
       projectId TEXT NOT NULL,
       title TEXT NOT NULL,
+      prefsJson TEXT,
       createdAt DATETIME NOT NULL,
       updatedAt DATETIME NOT NULL,
       CONSTRAINT ChatConversation_projectId_fkey FOREIGN KEY (projectId) REFERENCES ChatProject (id) ON DELETE CASCADE ON UPDATE CASCADE
@@ -55,6 +60,19 @@ export async function ensureChatWorkspaceTables() {
       CONSTRAINT ChatMessage_conversationId_fkey FOREIGN KEY (conversationId) REFERENCES ChatConversation (id) ON DELETE CASCADE ON UPDATE CASCADE
     )
   `);
+  // 增量迁移: 旧表无 processLog/finalDebug/finalAssets/prefsJson, 加上去 (SQLite JSON 列 = TEXT)
+  await addColumnIfMissing("ChatMessage", "processLog", "TEXT");
+  await addColumnIfMissing("ChatMessage", "finalDebug", "TEXT");
+  await addColumnIfMissing("ChatMessage", "finalAssets", "TEXT");
+  await addColumnIfMissing("ChatConversation", "prefsJson", "TEXT");
+}
+
+async function addColumnIfMissing(table: string, column: string, type: string) {
+  try {
+    await prisma.$executeRawUnsafe(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch {
+    // 列已存在, 忽略
+  }
 }
 
 export async function getChatProjectForUser(projectId: string, userId: string) {

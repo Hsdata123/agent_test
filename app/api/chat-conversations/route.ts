@@ -16,16 +16,19 @@ export async function POST(request: Request) {
     const now = new Date().toISOString();
     const id = randomUUID();
     const title = String(body.title || "新对话").trim() || "新对话";
+    // 新对话的默认偏好: useKnowledge=false, useQianchuan=true. 用户切换后 PATCH 到 prefsJson.
+    const defaultPrefs = { useKnowledge: false, useQianchuan: true };
     await prisma.$executeRawUnsafe(
-      `INSERT INTO ChatConversation (id, projectId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO ChatConversation (id, projectId, title, prefsJson, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
       id,
       projectId,
       title,
+      JSON.stringify(defaultPrefs),
       now,
       now
     );
     await prisma.$executeRawUnsafe(`UPDATE ChatProject SET updatedAt = ? WHERE id = ?`, now, projectId);
-    return NextResponse.json({ success: true, conversation: { id, projectId, title, createdAt: now, updatedAt: now } });
+    return NextResponse.json({ success: true, conversation: { id, projectId, title, prefsJson: JSON.stringify(defaultPrefs), createdAt: now, updatedAt: now } });
   } catch (error) {
     return jsonError(error);
   }
