@@ -9,6 +9,9 @@
     "db:push": "node prisma/init.mjs && prisma generate",
     "db:seed": "tsx prisma/seed.ts",
     "db:backfill-aliases": "tsx scripts/backfill-asset-aliases.ts",
+    "db:import-qianchuan-history": "tsx scripts/import-2025-history.ts",
+    "db:backfill-qianchuan": "tsx scripts/qianchuan-backfill.ts",
+    "db:sync-qianchuan": "tsx scripts/qianchuan-daily-sync.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {
@@ -16,10 +19,12 @@
     "antd": "^5.23.2",
     "archiver": "^7.0.1",
     "clsx": "^2.1.1",
+    "mysql2": "^3.22.5",
     "next": "^15.1.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^9.1.0",
+    "recharts": "^3.9.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { jsonError, requireUser } from "@/lib/auth";
+import { jsonError, requireUserWithAdvertiser } from "@/lib/auth";
 import { ensureChatWorkspaceTables, getChatConversationForUser } from "@/lib/chat-store";
 import { IThinkClient } from "@/lib/ithink";
 import { prisma } from "@/lib/prisma";
@@ -27,14 +27,16 @@ type ProcessEvent =
 
 export async function POST(request: Request) {
   try {
-    const user = await requireUser();
     const body = await request.json();
     const message = String(body.message || "").trim();
     const useAll = Boolean(body.useAll);
     const useKnowledge = body.useKnowledge === true;
+    const useQianchuan = body.useQianchuan !== false;
     const assetIds = Array.isArray(body.assetIds) ? body.assetIds.map(String) : [];
     const assetType = String(body.assetType || "all");
     const conversationId = String(body.conversationId || "");
+    const bodyAdvertiserId = typeof body.advertiserId === "string" && body.advertiserId.trim() ? body.advertiserId.trim() : null;
+    const { user, activeAdvertiserId } = await requireUserWithAdvertiser(request, bodyAdvertiserId);
     if (!message) throw Object.assign(new Error("请输入对话内容"), { status: 400 });
     const conversation = conversationId ? await getChatConversationForUser(conversationId, user.id) : null;
     if (conversationId && !conversation) throw Object.assign(new Error("对话不存在或无权限访问"), { status: 404 });
@@ -42,11 +44,17 @@ export async function POST(request: Request) {
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
+        // 累积 SSE 过程事件, done 后存 DB 供刷新恢复
+        const processLog: Array<Record<string, unknown>> = [];
         const send = (event: ProcessEvent) => {
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
           } catch {
             // stream closed
+          }
+          // 排除纯流式增量 (text) 与 usage, 其余事件用于刷新后恢复
+          if (event.type !== "text" && event.type !== "usage" && event.type !== "done") {
+            processLog.push(event as unknown as Record<string, unknown>);
           }
         };
 
@@ -111,7 +119,10 @@ export async function POST(request: Request) {
             if (scenes.length) {
               send({ type: "intent", scenes: intentScenes });
             }
-            toolDefinitions = await listOpenAITools();
+            const allTools = await listOpenAITools();
+            toolDefinitions = useQianchuan
+              ? allTools
+              : allTools.filter((t) => !/^qianchuan/i.test(t.function.name));
             usedPath = "skill";
           }
 
@@ -136,8 +147,9 @@ export async function POST(request: Request) {
               history,
               context,
               tools: toolDefinitions.length ? toolDefinitions : undefined,
-              ctx: { user },
-              isSkillPath: usedPath === "skill"
+              ctx: { user: { ...user, advertiserId: activeAdvertiserId } },
+              isSkillPath: usedPath === "skill",
+              useQianchuan
             },
             (chunk) => {
               if (chunk.type === "text") {
@@ -186,9 +198,6 @@ export async function POST(request: Request) {
               fullContext: runnerResult.skillContext
             });
           }
-          if (conversation) {
-            await appendConversationMessages(conversation.id, conversation.projectId, message, answer);
-          }
           await recordChatUsage({
             userId: user.id,
             message,
@@ -196,7 +205,8 @@ export async function POST(request: Request) {
             promptTokens: runnerResult.usage.promptTokens,
             completionTokens: runnerResult.usage.completionTokens,
             totalTokens: runnerResult.usage.totalTokens,
-            cachedTokens: runnerResult.usage.cachedTokens
+            cachedTokens: runnerResult.usage.cachedTokens,
+            cacheKey: config?.textPromptCacheKey || undefined
           });
           if (runnerResult.usage.promptTokens !== undefined || runnerResult.usage.completionTokens !== undefined) {
             send({
@@ -208,21 +218,47 @@ export async function POST(request: Request) {
             });
           }
           const contextPreview = (runnerResult.skillContext || context || "").slice(0, 1500);
+          // 路径 B (技能调用) 时, ranked 需要从 skillCalls[].matchedAssets 抽取, 否则面板 hasRefs=false
+          if (usedPath === "skill" && retrievedDebug.length === 0 && runnerResult.skillCalls.length) {
+            for (const call of runnerResult.skillCalls) {
+              for (const asset of call.matchedAssets || []) {
+                retrievedDebug.push({ id: asset.id, assetName: asset.assetName, assetType: asset.assetType, score: 0, scenes: [] });
+              }
+            }
+          }
+          const finalDebug = {
+            useKnowledgeSwitch: useKnowledge,
+            useQianchuanSwitch: useQianchuan,
+            usedPath,
+            intentScenes,
+            ranked: retrievedDebug,
+            baseAssetCount: usedAssetSummaries.length,
+            contextCharCount: runnerResult.skillContext.length || context?.length || 0,
+            contextPreview,
+            skillCalls: runnerResult.skillCalls
+          };
           send({
             type: "done",
             answer,
             usedAssets: usedAssetSummaries,
-            debug: {
-              useKnowledgeSwitch: useKnowledge,
-              usedPath,
-              intentScenes,
-              ranked: retrievedDebug,
-              baseAssetCount: usedPath === "manual" ? usedAssetSummaries.length : 0,
-              contextCharCount: runnerResult.skillContext.length || context?.length || 0,
-              contextPreview,
-              skillCalls: runnerResult.skillCalls
-            }
+            debug: finalDebug
           });
+          // 持久化失败仅记日志, 不再向客户端发 error 事件 (已经返回 done)
+          try {
+            if (conversation) {
+              await appendConversationMessages(
+                conversation.id,
+                conversation.projectId,
+                message,
+                answer,
+                processLog,
+                finalDebug,
+                usedAssetSummaries
+              );
+            }
+          } catch (persistErr) {
+            console.error("[chat] persist conversation failed", persistErr);
+          }
           controller.close();
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -231,8 +267,16 @@ export async function POST(request: Request) {
               ? ((error as { toJSON(): unknown }).toJSON() as Record<string, unknown>)
               : undefined;
           console.error("[chat] request failed", { message, details, stack: error instanceof Error ? error.stack : undefined });
-          send({ type: "error", error: message, details });
-          controller.close();
+          try {
+            send({ type: "error", error: message, details });
+          } catch {
+            // stream already closed
+          }
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
         }
       }
     });
@@ -267,7 +311,15 @@ async function loadConversationHistory(conversationId: string) {
   return rows.reverse().map((row) => ({ role: row.role, content: row.content }));
 }
 
-async function appendConversationMessages(conversationId: string, projectId: string, message: string, answer: string) {
+async function appendConversationMessages(
+  conversationId: string,
+  projectId: string,
+  message: string,
+  answer: string,
+  processLog?: Array<Record<string, unknown>>,
+  finalDebug?: Record<string, unknown>,
+  finalAssets?: Array<Record<string, unknown>>
+) {
   await ensureChatWorkspaceTables();
   const now = new Date().toISOString();
   await prisma.$executeRawUnsafe(
@@ -278,13 +330,17 @@ async function appendConversationMessages(conversationId: string, projectId: str
     message,
     now
   );
+  const assistantId = randomUUID();
   await prisma.$executeRawUnsafe(
-    `INSERT INTO ChatMessage (id, conversationId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)`,
-    randomUUID(),
+    `INSERT INTO ChatMessage (id, conversationId, role, content, createdAt, processLog, finalDebug, finalAssets) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    assistantId,
     conversationId,
     "assistant",
     answer,
-    new Date().toISOString()
+    new Date().toISOString(),
+    processLog ? JSON.stringify(processLog) : null,
+    finalDebug ? JSON.stringify(finalDebug) : null,
+    finalAssets ? JSON.stringify(finalAssets) : null
   );
   const titleRows = await prisma.$queryRawUnsafe<Array<{ title: string; messageCount: bigint | number }>>(
     `SELECT c.title as title, COUNT(m.id) as messageCount
@@ -297,7 +353,7 @@ async function appendConversationMessages(conversationId: string, projectId: str
   const title = titleRows[0]?.title;
   const messageCount = Number(titleRows[0]?.messageCount || 0);
   const nextTitle = title === "新对话" && messageCount <= 2 ? message.slice(0, 32) || "新对话" : title;
-  await prisma.$executeRawUnsafe(`UPDATE ChatConversation SET title = ?, updatedAt = ? WHERE id = ?`, nextTitle, now, projectId);
+  await prisma.$executeRawUnsafe(`UPDATE ChatConversation SET title = ?, updatedAt = ? WHERE id = ?`, nextTitle, now, conversationId);
   await prisma.$executeRawUnsafe(`UPDATE ChatProject SET updatedAt = ? WHERE id = ?`, now, projectId);
 }
 
@@ -309,6 +365,7 @@ async function recordChatUsage(input: {
   completionTokens?: number;
   totalTokens?: number;
   cachedTokens?: number;
+  cacheKey?: string;
 }) {
   await ensureChatUsageTable();
   const promptTokens = input.promptTokens ?? estimateTokens(input.message);
@@ -317,14 +374,15 @@ async function recordChatUsage(input: {
   const cachedTokens = input.cachedTokens ?? 0;
   const estimatedCost = estimateChatCost(promptTokens, completionTokens);
   await prisma.$executeRawUnsafe(
-    `INSERT INTO ChatUsage (id, userId, promptTokens, completionTokens, totalTokens, cachedTokens, estimatedCost, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ChatUsage (id, userId, promptTokens, completionTokens, totalTokens, cachedTokens, cacheKey, estimatedCost, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     randomUUID(),
     input.userId,
     promptTokens,
     completionTokens,
     totalTokens,
     cachedTokens,
+    input.cacheKey || null,
     estimatedCost,
     new Date().toISOString()
   );
@@ -339,6 +397,7 @@ async function ensureChatUsageTable() {
       completionTokens INTEGER NOT NULL DEFAULT 0,
       totalTokens INTEGER NOT NULL DEFAULT 0,
       cachedTokens INTEGER NOT NULL DEFAULT 0,
+      cacheKey TEXT,
       estimatedCost REAL NOT NULL DEFAULT 0,
       createdAt DATETIME NOT NULL,
       CONSTRAINT ChatUsage_userId_fkey FOREIGN KEY (userId) REFERENCES User (id) ON DELETE CASCADE ON UPDATE CASCADE
@@ -346,6 +405,11 @@ async function ensureChatUsageTable() {
   `);
   try {
     await prisma.$executeRawUnsafe(`ALTER TABLE ChatUsage ADD COLUMN cachedTokens INTEGER NOT NULL DEFAULT 0`);
+  } catch {
+    // Column already exists.
+  }
+  try {
+    await prisma.$executeRawUnsafe(`ALTER TABLE ChatUsage ADD COLUMN cacheKey TEXT`);
   } catch {
     // Column already exists.
   }

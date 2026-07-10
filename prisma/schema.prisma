@@ -15,6 +15,7 @@ model User {
   role         String     @default("creator")
   status       String     @default("active")
   departmentId String?
+  advertiserId String?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   lastLoginAt  DateTime?
@@ -27,6 +28,21 @@ model User {
   tasks        GenerationTask[]
   sessions     Session[]
   skills       Skill[]
+  advertiserBindings UserAdvertiserBinding[]
+}
+
+model UserAdvertiserBinding {
+  id           String   @id @default(cuid())
+  userId       String
+  advertiserId String
+  isPrimary    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, advertiserId])
+  @@index([userId])
+  @@index([advertiserId])
 }
 
 model Session {
@@ -179,9 +195,9 @@ model GenerationResult {
 
 model ApiConfig {
   id             String   @id @default("singleton")
-  textBaseUrl    String   @default("https://token.ithinkai.cn/v1")
-  textModel      String   @default("gpt-5.5-token")
-  textWireApi    String   @default("responses")
+  textBaseUrl    String   @default("https://api.minimaxi.com/anthropic")
+  textModel      String   @default("MiniMax-M3")
+  textWireApi    String   @default("anthropic")
   textPromptCacheEnabled Boolean @default(true)
   textPromptCacheRetention String @default("24h")
   textPromptCacheKey String @default("commerce-chat")
@@ -245,4 +261,48 @@ model Skill {
 
   @@index([departmentId])
   @@index([deletedAt])
+}
+
+model QianchuanToken {
+  id                  String    @id @default(cuid())
+  appId               String    @unique
+  appSecret           String
+  accessToken         String
+  refreshToken        String
+  accessTokenExpireAt DateTime
+  refreshTokenExpireAt DateTime
+  scope               String?
+  lastRefreshAt       DateTime?
+  lastError           String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  advertisers         QianchuanAdvertiser[]
+}
+
+model QianchuanAdvertiser {
+  id            String         @id @default(cuid())
+  tokenId       String
+  advertiserId  String
+  nickname      String?
+  createdAt     DateTime       @default(now())
+
+  token         QianchuanToken @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@unique([tokenId, advertiserId])
+  @@index([advertiserId])
+}
+
+model QianchuanAnchor {
+  id            String         @id @default(cuid())
+  advertiserId  String
+  anchorId      String
+  anchorName    String
+  nickname      String?
+  lastSeenAt    DateTime       @default(now())
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@unique([advertiserId, anchorId])
+  @@index([advertiserId, anchorName])
 }

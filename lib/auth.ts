@@ -5,6 +5,7 @@ import { prisma } from "./prisma";
 import { roleHasPermission } from "./roles";
 
 export const SESSION_COOKIE = "commerce_session";
+export const CURRENT_ADVERTISER_COOKIE = "commerce_current_advertiser";
 export type UserRole = "admin" | "creator" | "editor" | "viewer";
 
 export function hashToken(token: string) {
@@ -45,6 +46,10 @@ export async function requireAdmin() {
     throw Object.assign(new Error("无权限访问 API 配置"), { status: 403 });
   }
   return user;
+}
+
+export async function requireSuperAdmin() {
+  return requireAdmin();
 }
 
 export async function requireDeptAdmin(targetDepartmentId?: string | null) {
@@ -97,4 +102,38 @@ export function setSessionCookie(response: NextResponse, token: string, expiresA
     expires: expiresAt,
     path: "/"
   });
+}
+
+export function setCurrentAdvertiserCookie(response: NextResponse, advertiserId: string) {
+  response.cookies.set(CURRENT_ADVERTISER_COOKIE, advertiserId, {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/"
+  });
+}
+
+export function clearCurrentAdvertiserCookie(response: NextResponse) {
+  response.cookies.set(CURRENT_ADVERTISER_COOKIE, "", {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/",
+    expires: new Date(0)
+  });
+}
+
+export async function requireUserWithAdvertiser(
+  request: Request,
+  bodyAdvertiserId?: string | null
+) {
+  const user = await requireUser();
+  const { resolveCurrentAdvertiser, AdvertiserResolveError } = await import("./qianchuan/current");
+  try {
+    const activeAdvertiserId = await resolveCurrentAdvertiser(user, request, bodyAdvertiserId);
+    return { user, activeAdvertiserId };
+  } catch (e) {
+    if (e instanceof AdvertiserResolveError) {
+      throw Object.assign(new Error(e.message), { status: e.status });
+    }
+    throw e;
+  }
 }

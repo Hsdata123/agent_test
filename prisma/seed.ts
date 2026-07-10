@@ -46,10 +46,10 @@ async function main() {
     update: {},
     create: {
       id: "singleton",
-      textBaseUrl: process.env.ITHINK_BASE_URL || "https://token.ithinkai.cn/v1",
-      imageBaseUrl: process.env.ITHINK_BASE_URL || "https://token.ithinkai.cn/v1",
-      textModel: process.env.ITHINK_CHAT_MODEL || "gpt-5.5-token",
-      textWireApi: "responses",
+      textBaseUrl: process.env.ITHINK_BASE_URL || "https://api.minimaxi.com/anthropic",
+      imageBaseUrl: process.env.ITHINK_IMAGE_BASE_URL || "https://token.ithinkai.cn/v1",
+      textModel: process.env.ITHINK_CHAT_MODEL || "MiniMax-M3",
+      textWireApi: "anthropic",
       textPromptCacheEnabled: true,
       textPromptCacheRetention: "24h",
       textPromptCacheKey: "commerce-chat",
@@ -74,6 +74,21 @@ async function main() {
     where: { projectId_userId: { projectId: project.id, userId: creator.id } },
     update: { role: "editor" },
     create: { projectId: project.id, userId: creator.id, role: "editor" }
+  });
+
+  await prisma.userAdvertiserBinding.upsert({
+    where: { userId_advertiserId: { userId: admin.id, advertiserId: "1859801208261002" } },
+    update: { isPrimary: true },
+    create: { userId: admin.id, advertiserId: "1859801208261002", isPrimary: true }
+  });
+  await prisma.userAdvertiserBinding.upsert({
+    where: { userId_advertiserId: { userId: admin.id, advertiserId: "1757724572785671" } },
+    update: {},
+    create: { userId: admin.id, advertiserId: "1757724572785671", isPrimary: false }
+  });
+  await prisma.user.update({
+    where: { id: admin.id },
+    data: { advertiserId: "1859801208261002" }
   });
 }
 

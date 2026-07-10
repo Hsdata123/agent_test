@@ -21,6 +21,7 @@ export async function GET(request: Request) {
         role: true,
         status: true,
         departmentId: true,
+        advertiserId: true,
         createdAt: true,
         lastLoginAt: true
       }

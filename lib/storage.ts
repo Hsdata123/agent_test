@@ -12,8 +12,21 @@ export async function ensureStorage() {
   await fs.mkdir(resultDir, { recursive: true });
 }
 
+const MAX_SAFE_NAME = 80;
+
 export function safeFileName(name: string) {
-  return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").trim() || "file";
+  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").trim() || "file";
+  if (cleaned.length <= MAX_SAFE_NAME) return cleaned;
+  // 保留扩展名 (任意长度), 防止 CJK + 超长文件名让 storagePath 损坏或超 Windows MAX_PATH
+  const dot = cleaned.lastIndexOf(".");
+  if (dot <= 0) {
+    return cleaned.slice(0, MAX_SAFE_NAME);
+  }
+  const ext = cleaned.slice(dot);
+  if (ext.length >= MAX_SAFE_NAME) {
+    return cleaned.slice(0, MAX_SAFE_NAME);
+  }
+  return cleaned.slice(0, MAX_SAFE_NAME - ext.length) + ext;
 }
 
 export function nameWithoutExt(fileName: string) {
